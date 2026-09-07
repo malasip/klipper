@@ -23,16 +23,16 @@ The mainboard uses a GD32F303RET6 processor, which is software-compatible with t
 1. Configure Klipper:
    * **Micro-controller Architecture**: `STMicroelectronics STM32`
    * **Processor model**: `STM32F103`
-   * **Bootloader offset**: `No bootloader` (Flash starts at `0x08000000`)
+   * **Bootloader offset**: `12KiB bootloader` (Flash starts at `0x08003000`)
    * **Clock Reference**: `8 MHz crystal`
    * **Communication interface**: `Serial (on USART2 PA3/PA2)`
    * **Baud rate for serial port**: `230400`
-   * **GPIO pins to set at startup**: `PA0` (turns on mainboard fan)
+   * **GPIO pins to set at startup**: `!PB1,!PB2,!PB3,!PB4,!PA0,PA4,PA11,PB0,PA12,!PC8,!PC12`
 2. Compile the firmware:
    ```bash
    make clean
    make
-   cp out/klipper.bin build_artifacts/klipper_mainboard_nobootloader.bin
+   cp out/klipper.bin build_artifacts/klipper_mainboard_12k.bin
    ```
 
 ---
@@ -44,16 +44,17 @@ The toolhead board runs on a GD32F303CBT6 microcontroller.
 1. Configure Klipper:
    * **Micro-controller Architecture**: `STMicroelectronics STM32`
    * **Processor model**: `STM32F103`
-   * **Bootloader offset**: `No bootloader` (Flash starts at `0x08000000`)
+   * **Bootloader offset**: `12KiB bootloader` (Flash starts at `0x08003000`)
    * **Clock Reference**: `8 MHz crystal`
-   * **Communication interface**: `Serial (on USART3 PB11/PB10)`
+   * **Communication interface**: `Serial (on USART2 PA3/PA2)`
    * **Baud rate for serial port**: `230400`
+   * **GPIO pins to set at startup**: `!PB1,!PB3,!PB8,!PB15`
    * **Include CS1237 sensor driver**: Enabled by default in `src/Kconfig`
 2. Compile the firmware:
    ```bash
    make clean
    make
-   cp out/klipper.bin build_artifacts/klipper_toolhead_nobootloader.bin
+   cp out/klipper.bin build_artifacts/klipper_toolhead_12k.bin
    ```
 
 ---
@@ -72,10 +73,10 @@ An automated flashing script [`build_artifacts/flash_k2_mcu.sh`](file:///home/mi
 
 ```bash
 # Flash Mainboard MCU:
-./flash_k2_mcu.sh /dev/ttyS2 klipper_mainboard_nobootloader.bin
+./flash_k2_mcu.sh /dev/ttyS2 klipper_mainboard_12k.bin
 
 # Flash Toolhead MCU:
-./flash_k2_mcu.sh /dev/ttyS3 klipper_toolhead_nobootloader.bin
+./flash_k2_mcu.sh /dev/ttyS3 klipper_toolhead_12k.bin
 ```
 
 #### Manual Flashing Sequence:
