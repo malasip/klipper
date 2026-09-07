@@ -114,6 +114,22 @@ cs1237_raw_read(struct cs1237_adc *cs)
 }
 
 static void
+add_sample(struct cs1237_adc *cs, uint8_t oid, int32_t sample,
+           uint8_t force_flush)
+{
+    uint32_t counts = (uint32_t)sample;
+    cs->sb.data[cs->sb.data_count] = counts;
+    cs->sb.data[cs->sb.data_count + 1] = counts >> 8;
+    cs->sb.data[cs->sb.data_count + 2] = counts >> 16;
+    cs->sb.data[cs->sb.data_count + 3] = counts >> 24;
+    cs->sb.data_count += BYTES_PER_SAMPLE;
+
+    if (cs->sb.data_count + BYTES_PER_SAMPLE > ARRAY_SIZE(cs->sb.data)
+        || force_flush)
+        sensor_bulk_report(&cs->sb, oid);
+}
+
+static void
 cs1237_read_adc(struct cs1237_adc *cs, uint8_t oid)
 {
     irq_disable();
@@ -136,12 +152,12 @@ cs1237_read_adc(struct cs1237_adc *cs, uint8_t oid)
         sample = SAMPLE_ERROR_DESYNC;
     }
 
-    // Report sample to bulk sensor subsystem and trigger analog
-    uint32_t clock = timer_read_time();
-    sensor_bulk_report(&cs->sb, clock, 1, &sample);
-    if (cs->ta) {
+    if (sample > 0 || (sample != SAMPLE_ERROR_READ_TOO_LONG
+                       && sample != SAMPLE_ERROR_DESYNC)) {
         trigger_analog_update(cs->ta, sample);
     }
+
+    add_sample(cs, oid, sample, false);
 }
 
 static uint_fast8_t
