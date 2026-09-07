@@ -7,6 +7,7 @@
 from . import hx71x
 from . import ads1220
 from . import ads131m0x
+from . import cs1237
 from .bulk_sensor import BatchWebhooksClient
 import collections, itertools
 # We want either Python 3's zip() or Python 2's izip() but NOT 2's zip():
@@ -533,6 +534,7 @@ def load_config(config):
     # Sensor types
     sensors = {}
     sensors.update(hx71x.HX71X_SENSOR_TYPES)
+    sensors.update(cs1237.CS1237_SENSOR_TYPE)
     sensors.update(ads1220.ADS1220_SENSOR_TYPE)
     sensors.update(ads131m0x.ADS131M0X_SENSOR_TYPES)
     sensor_class = config.getchoice('sensor_type', sensors)

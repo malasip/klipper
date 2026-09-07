@@ -164,6 +164,10 @@ config WANT_HX71X
     bool
     depends on HAVE_GPIO
     default y
+config WANT_CS1237
+    bool
+    depends on HAVE_GPIO
+    default y
 config WANT_ADS131M0X
     bool
     depends on WANT_SPI
