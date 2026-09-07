@@ -20,28 +20,20 @@ This guide explains how to compile and flash clean, upstream Klipper firmware fo
 
 The mainboard uses a GD32F303RET6 processor, which is software-compatible with the STMicroelectronics STM32F103 family running with an ARM Cortex-M4 core.
 
-1. Navigate to the Klipper directory:
-   ```bash
-   cd k2_pro_mainline
-   ```
-2. Open Klipper configuration menu:
-   ```bash
-   make menuconfig
-   ```
-3. Set the following parameters:
+1. Configure Klipper:
    * **Micro-controller Architecture**: `STMicroelectronics STM32`
    * **Processor model**: `STM32F103`
-   * **Bootloader offset**: `64KiB bootloader` (or match stock bootloader partition offset)
+   * **Bootloader offset**: `No bootloader` (Flash starts at `0x08000000`)
    * **Clock Reference**: `8 MHz crystal`
    * **Communication interface**: `Serial (on USART2 PA3/PA2)`
    * **Baud rate for serial port**: `230400`
-   * **GPIO pins to set at micro-controller startup**: `PA0` (turns on mainboard fan)
-4. Compile the firmware:
+   * **GPIO pins to set at startup**: `PA0` (turns on mainboard fan)
+2. Compile the firmware:
    ```bash
    make clean
    make
+   cp out/klipper.bin build_artifacts/klipper_mainboard_nobootloader.bin
    ```
-5. The output binary is saved to `out/klipper.bin`.
 
 ---
 
@@ -49,42 +41,59 @@ The mainboard uses a GD32F303RET6 processor, which is software-compatible with t
 
 The toolhead board runs on a GD32F303CBT6 microcontroller.
 
-1. Open Klipper configuration menu:
-   ```bash
-   make menuconfig
-   ```
-2. Set the following parameters:
+1. Configure Klipper:
    * **Micro-controller Architecture**: `STMicroelectronics STM32`
    * **Processor model**: `STM32F103`
-   * **Bootloader offset**: `No bootloader` or `28KiB bootloader` (check partition table)
+   * **Bootloader offset**: `No bootloader` (Flash starts at `0x08000000`)
    * **Clock Reference**: `8 MHz crystal`
    * **Communication interface**: `Serial (on USART3 PB11/PB10)`
    * **Baud rate for serial port**: `230400`
    * **Include CS1237 sensor driver**: Enabled by default in `src/Kconfig`
-3. Compile the firmware:
+2. Compile the firmware:
    ```bash
    make clean
    make
+   cp out/klipper.bin build_artifacts/klipper_toolhead_nobootloader.bin
    ```
-4. Save the compiled binary as `out/klipper_toolhead.bin`.
 
 ---
 
 ## 4. Flashing Methods
 
-### Option A: Internal Host Serial Flash (Recommended)
-Because the microcontrollers are wired to the Allwinner T113-i host via `/dev/ttyS2` and `/dev/ttyS3`, you can use Klipper's `scripts/flash_usb.py` or standard STM32 serial flashing tools (such as `stm32flash`):
+### Option A: Host Internal Serial Flash via `mcu_util` & `mcu_reset.sh` (Recommended)
+
+The K2 Pro microcontrollers run a stock serial bootloader that is active for **10 seconds** immediately after power is applied.
+
+Power to the MCU rail is controlled by the Allwinner T113-i SoC via GPIO **`PE12`** (Pin **`140`**):
+* `0`: Power ON
+* `1`: Power OFF
+
+An automated flashing script [`build_artifacts/flash_k2_mcu.sh`](file:///home/mika/Projects/k2_pro_mainline/build_artifacts/flash_k2_mcu.sh) executes the power cycle, handshakes within the 10-second window, and flashes the firmware:
 
 ```bash
-# Flash Main MCU:
-stm32flash -b 230400 -w out/klipper.bin -v -g 0x0 /dev/ttyS2
+# Flash Mainboard MCU:
+./flash_k2_mcu.sh /dev/ttyS2 klipper_mainboard_nobootloader.bin
 
 # Flash Toolhead MCU:
-stm32flash -b 230400 -w out/klipper_toolhead.bin -v -g 0x0 /dev/ttyS3
+./flash_k2_mcu.sh /dev/ttyS3 klipper_toolhead_nobootloader.bin
 ```
 
+#### Manual Flashing Sequence:
+1. Power cycle MCU:
+   ```bash
+   /usr/bin/mcu_reset.sh
+   # Or directly:
+   echo 1 > /sys/class/gpio/gpio140/value && sleep 2 && echo 0 > /sys/class/gpio/gpio140/value
+   ```
+2. Within 10 seconds, handshake and flash:
+   ```bash
+   mcu_util -i /dev/ttyS2 -c -v
+   mcu_util -i /dev/ttyS2 -u -f klipper_mainboard_nobootloader.bin -H -v
+   mcu_util -i /dev/ttyS2 -s -v
+   ```
+
 ### Option B: SWD Programmer (ST-Link / J-Link)
-Both boards expose standard SWD (SWDIO / SWCLK / GND / 3.3V) programming test points on the PCB. If the bootloader is ever corrupted, connect an ST-Link V2 or Raspberry Pi Pico running Picoprobe to flash via OpenOCD:
+Both boards expose standard SWD (SWDIO / SWCLK / GND / 3.3V) programming test points on the PCB. If ever needed, connect an ST-Link V2 or Raspberry Pi Pico running Picoprobe to flash via OpenOCD:
 
 ```bash
 openocd -f interface/stlink.cfg -f target/stm32f1x.cfg -c "program out/klipper.bin 0x08000000 verify reset exit"
