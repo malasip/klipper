@@ -22,6 +22,9 @@ SECTIONS
         _text_vectortable_start = .;
         KEEP(*(.vector_table))
         _text_vectortable_end = .;
+#if CONFIG_STM32_FLASH_START_3000 || CONFIG_GD32_FLASH_START_3000
+        . = _text_vectortable_start + 0x220;
+#endif
         *(.text .text.*)
         *(.rodata .rodata*)
     } > rom

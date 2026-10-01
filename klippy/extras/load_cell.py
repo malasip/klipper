@@ -388,18 +388,23 @@ class LoadCell:
                                    minval=MIN_COUNTS_PER_GRAM, default=None)
         self.invert = config.getchoice('sensor_orientation',
                         {'normal': 1., 'inverted': -1.}, default="normal")
+        self._is_sampling = False
+        self._sampling_requests = 0
+        self.continuous_monitoring = config.getboolean(
+            'continuous_monitoring', False)
         LoadCellCommandHelper(config, self)
         # Client support:
         self.clients = ApiClientHelper(printer)
         header = {"header": ["time", "force (g)", "counts", "tare_counts"]}
         self.clients.add_mux_endpoint("load_cell/dump_force",
                                       "load_cell", self.name, header)
-        # startup, when klippy is ready, start capturing data
+        self.add_client(self._track_force)
+        # startup, when klippy is ready, start capturing data if continuous monitoring is enabled
         printer.register_event_handler("klippy:ready", self._handle_ready)
 
     def _handle_do_ready(self, eventtime):
-        self.sensor.add_client(self._sensor_data_event)
-        self.add_client(self._track_force)
+        if self.continuous_monitoring:
+            self.start_sampling()
         # announce calibration status on ready
         if self.is_calibrated():
             self.printer.send_event("load_cell:calibrate", self)
@@ -408,8 +413,27 @@ class LoadCell:
     def _handle_ready(self):
         self.printer.get_reactor().register_callback(self._handle_do_ready)
 
+    def start_sampling(self):
+        self._sampling_requests += 1
+        if not self._is_sampling:
+            self._is_sampling = True
+            self.sensor.add_client(self._sensor_data_event)
+
+    def stop_sampling(self):
+        if self._sampling_requests > 0:
+            self._sampling_requests -= 1
+        if self._sampling_requests == 0 and self._is_sampling:
+            self._is_sampling = False
+            if hasattr(self.sensor, 'remove_client'):
+                self.sensor.remove_client(self._sensor_data_event)
+
+    def is_sampling(self):
+        return self._is_sampling
+
     # convert raw counts to grams and broadcast to clients
     def _sensor_data_event(self, msg):
+        if not self._is_sampling:
+            return False
         data = msg.get("data")
         errors = msg.get("errors")
         overflows = msg.get("overflows")
@@ -467,18 +491,22 @@ class LoadCell:
     def avg_counts(self, num_samples=None):
         if num_samples is None:
             num_samples = int(self.sensor.get_samples_per_second())
-        samples, errors = self.get_collector().collect_min(num_samples)
-        if errors:
-            raise self.printer.command_error(
-                "Sensor reported %i errors while sampling"
-                    % (errors[0] + errors[1]))
-        # check samples for saturated readings
-        range_min, range_max = self.saturation_range()
-        for sample in samples:
-            if sample[2] >= range_max or sample[2] <= range_min:
+        self.start_sampling()
+        try:
+            samples, errors = self.get_collector().collect_min(num_samples)
+            if errors:
                 raise self.printer.command_error(
-                    "Some samples are saturated (+/-100%)")
-        return avg(select_column(samples, 2))
+                    "Sensor reported %i errors while sampling"
+                        % (errors[0] + errors[1]))
+            # check samples for saturated readings
+            range_min, range_max = self.saturation_range()
+            for sample in samples:
+                if sample[2] >= range_max or sample[2] <= range_min:
+                    raise self.printer.command_error(
+                        "Some samples are saturated (+/-100%)")
+            return avg(select_column(samples, 2))
+        finally:
+            self.stop_sampling()
 
     # Provide ongoing force tracking/averaging for status updates
     def _track_force(self, msg):

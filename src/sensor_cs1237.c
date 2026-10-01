@@ -176,6 +176,73 @@ cs1237_event(struct timer *timer)
  * Commands and Interface
  ****************************************************************/
 
+static void
+cs1237_write_config(struct cs1237_adc *cs, uint8_t dout_pin, uint8_t cfg_reg)
+{
+    // Wait for DOUT to go low (data ready)
+    uint32_t timeout = timer_read_time() + timer_from_us(150000);
+    while (gpio_in_read(cs->dout)) {
+        if (timer_is_before(timeout, timer_read_time()))
+            return;
+    }
+
+    // Clock out 24 data bits + 3 status bits (total 27 clock pulses)
+    irq_disable();
+    for (int i = 0; i < 27; i++) {
+        gpio_out_write(cs->sclk, 1);
+        cs1237_delay_noirq();
+        gpio_out_write(cs->sclk, 0);
+        cs1237_delay_noirq();
+    }
+
+    // Switch DOUT to output mode
+    struct gpio_out dout_out = gpio_out_setup(dout_pin, 1);
+
+    // 2 clock pulses (28, 29)
+    for (int i = 0; i < 2; i++) {
+        gpio_out_write(cs->sclk, 1);
+        cs1237_delay_noirq();
+        gpio_out_write(cs->sclk, 0);
+        cs1237_delay_noirq();
+    }
+
+    // Pulses 30-36: Send 0x65 write command (7 bits, MSB first)
+    for (int i = 0; i < 7; i++) {
+        uint8_t bit = (0x65 >> (6 - i)) & 1;
+        gpio_out_write(dout_out, bit);
+        gpio_out_write(cs->sclk, 1);
+        cs1237_delay_noirq();
+        gpio_out_write(cs->sclk, 0);
+        cs1237_delay_noirq();
+    }
+
+    // Pulse 37: 1 clock pulse
+    gpio_out_write(cs->sclk, 1);
+    cs1237_delay_noirq();
+    gpio_out_write(cs->sclk, 0);
+    cs1237_delay_noirq();
+
+    // Pulses 38-45: Send 8-bit config register data (MSB first)
+    for (int i = 0; i < 8; i++) {
+        uint8_t bit = (cfg_reg >> (7 - i)) & 1;
+        gpio_out_write(dout_out, bit);
+        gpio_out_write(cs->sclk, 1);
+        cs1237_delay_noirq();
+        gpio_out_write(cs->sclk, 0);
+        cs1237_delay_noirq();
+    }
+
+    // Pulse 46: 1 clock pulse
+    gpio_out_write(cs->sclk, 1);
+    cs1237_delay_noirq();
+    gpio_out_write(cs->sclk, 0);
+    cs1237_delay_noirq();
+
+    // Switch DOUT back to input mode with pull-up
+    cs->dout = gpio_in_setup(dout_pin, 1);
+    irq_enable();
+}
+
 void
 command_config_cs1237(uint32_t *args)
 {
@@ -185,6 +252,9 @@ command_config_cs1237(uint32_t *args)
     cs->dout = gpio_in_setup(args[2], 1);
     cs->sclk = gpio_out_setup(args[3], 0);
     gpio_out_write(cs->sclk, 0);
+    if (cs->cfg_reg) {
+        cs1237_write_config(cs, args[2], cs->cfg_reg);
+    }
 }
 DECL_COMMAND(command_config_cs1237, "config_cs1237 oid=%c cfg_reg=%c dout_pin=%u sclk_pin=%u");
 

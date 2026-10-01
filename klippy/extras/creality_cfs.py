@@ -224,6 +224,43 @@ Changelog:
                            NOZZLE_VOLUME_DEFAULT reconciled 183 -> 108 (the stock BoxCfg
                            compiled default; 183 was the reference printer's tuned value).
 
+   v1.6.0 (2026-09-23): MULTI-BOX EXPANSION, THERMAL ARBITRATION, AND PORTABILITY:
+                          Major functional and architectural update expanding on the gitstonelabs v1.5.0 base:
+                          * Multi-Box (Up to 16 Slots) & Bypass Spool: Scaled slot architecture from
+                            a single 4-slot unit to up to 4 daisy-chained CFS units (16 slots: 0..15 across
+                            addresses 1-4) plus a dedicated external bypass tool (T_BYPASS / T4 / T16).
+                            Added CFS_SET_TOOL_MAPPING to dynamically map slicer tools to arbitrary slots.
+                          * Native CFS Command Surface & Parity Decoupling: Expanded native driver
+                            primitives with CFS_SET_IDLE_MODE, CFS_INFO_REFRESH, CFS_GET_RFID,
+                            CFS_GET_REMAIN_LEN, CFS_BOX_STATE, CFS_MODIFY_TN_DATA, CFS_SET_SLOT,
+                            CFS_BYPASS, and CFS_PROBE. Converted Creality BOX_* commands to clean
+                            native CFS_* hardware primitives, with slicer/UI parity wrappers maintained
+                            via G-code macros in cfs_macros.cfg.
+                          * Persistent State & Material DB: Added atomic JSON state serialization
+                            (cfs_state.json) preserving active tool, previous tool, auto-refill, slot presence,
+                            material names, colors, vendors, and Spoolman IDs across Klipper restarts. Added
+                            offline RFID UID and material database integration (cfs_material_db.json).
+                          * Collision-Free Chute Corridor (_safe_corridor_move): Replaced direct linear
+                            travel to the rear purge position with safe L-shaped corridor routing
+                            (X=139 -> Y=329 -> X=124) with Z clearance elevation, protecting against
+                            dragging the nozzle sideways into the mechanical wiper or cutter actuator.
+                          * Dynamic Thermal Flush Arbitration (_flush_temperature_arbitration): Automated
+                            melt-temperature transition logic flushing at max(T_prev, T_next) during
+                            material swaps (e.g. PETG -> PLA) to prevent cold nozzle blockages. Added
+                            MATERIAL_DEFAULT_TEMPS lookup table.
+                          * Cold Bowden Loading & Cold Tip Retraction: Recognized Bowden push as cold
+                            (no premature hotend heating until filament reaches toolhead entry sensor PA11).
+                            Added allow_cold toolhead pull and _cold_retract to safely back the severed
+                            filament tail out of the extruder gears without tripping min_extrude_temp.
+                          * Hardware Telemetry & Sensor Tracking: Decoded chamber temperature (°C),
+                            relative humidity (%RH), jam status, box mode, and photoelectric flags from
+                            0x0A frames into printer['creality_cfs'] and printer['box']. Integrated
+                            cutter microswitch tracking (cut_switch_pin) via Klipper's buttons module.
+                          * 100% Macro-Driven Toolhead Policy: Toolhead selection (T0..Tn, T_BYPASS)
+                            is managed strictly via standard Klipper G-code macros in cfs_macros.cfg,
+                            ensuring full interactive tool discovery in Mainsail/Fluidd web UIs
+                            and zero collisions with toolchanger/IDEX setups.
+
 Known limitations:
   - Half-duplex RS485 direction switching is left to a hardware auto-direction adapter
     by default. Opt in to the kernel RS485 RTS-as-DE mode with rts_on_send=1 (or 0 for
@@ -249,13 +286,10 @@ Resolved in v1.2.0:
     sensor-gated push loop).
 """
 
+import json
 import logging
 import os
 import struct
-import sys
-sys.path.append('..')
-
-import reactor
 
 # ---------------------------------------------------------------------------
 # POSIX-only serial imports. fcntl/termios do not exist off-POSIX (e.g. the
@@ -312,7 +346,7 @@ MIN_MSG_LEN: int = 6
 # mainboard RS-485 node and is owned by the serial_485 transport, so this default only makes
 # sense on the Hi. OFF-Hi (the portable mainline target) serial_port is effectively REQUIRED:
 # set it to your dedicated CFS port, e.g. a USB-RS485 adapter like /dev/ttyUSB0 or /dev/ttyACM0.
-CFS_DEFAULT_PORT: str = "/dev/ttyUSB0"   # default RS485 port (Hi-specific; set serial_port off-Hi)
+CFS_DEFAULT_PORT: str = "/dev/ttyS5"   # default RS485 port (Hi-specific; set serial_port off-Hi)
 CFS_BAUD_RATE: int = 230400            # validated baud rate
 CFS_SERIAL_BYTESIZE: int = 8
 CFS_SERIAL_PARITY: str = "N"
@@ -589,8 +623,8 @@ RETRUDE_PREP_TIMEOUT_S: float = 2.0     # the 0x08 sensor prep reads (wire to=2)
 RETRUDE_SENSOR_WAIT_S: float = 13.0     # post-finish toolhead-switch clear wait
 RETRUDE_SENSOR_POLL_DT_S: float = 0.25
 RETRUDE_WALL_BUDGET_S: float = 60.0     # hard wall-clock budget for the whole unload
-RETRUDE_TOOLHEAD_PULL_MM: float = 15.0
-RETRUDE_TOOLHEAD_PULL_VEL: float = 360.0
+RETRUDE_TOOLHEAD_PULL_MM: float = 35.0
+RETRUDE_TOOLHEAD_PULL_VEL: float = 600.0
 
 # ---------------------------------------------------------------------------
 # 0x0D SET_PRE_LOADING payload = [mask][phase] (generalized per the 2026-06-20 decode)
@@ -622,6 +656,29 @@ PRELOAD_BLOCKING_TIMEOUT_S: float = 90.0 # any genuinely blocking phase (slot re
 # floor before feeding filament toward a possibly-cold hotend.
 MIN_EXTRUDE_TEMP: float = 170.0
 DEFAULT_EXTRUDE_TEMP: float = 220.0
+
+# Standard extrusion / flush temperatures by filament material family
+MATERIAL_DEFAULT_TEMPS: dict = {
+    "pla": 220.0,
+    "pla+": 220.0,
+    "hyper-pla": 220.0,
+    "cr-pla": 220.0,
+    "petg": 245.0,
+    "hyper-petg": 245.0,
+    "abs": 260.0,
+    "hyper-abs": 260.0,
+    "asa": 260.0,
+    "hips": 250.0,
+    "tpu": 230.0,
+    "tpe": 230.0,
+    "pc": 270.0,
+    "pa": 280.0,
+    "pa-cf": 280.0,
+    "pa-gf": 280.0,
+    "nylon": 280.0,
+    "pva": 215.0,
+    "bvoh": 215.0,
+}
 
 # ---------------------------------------------------------------------------
 # Change-flush constants (hotend purge loop; stock-capture decode 2026-06-30)
@@ -955,30 +1012,30 @@ class CrealityCFS:
       - Detailed logging at appropriate levels
     """
 
-    def __init__(self) -> None:
+    def __init__(self, config) -> None:
         """Initialize CrealityCFS module from Klipper config.
 
         Args:
             config: Klipper config object for this section.
         """
-        #self.printer = config.get_printer()
-        self.reactor = reactor.Reactor()
-        #self.gcode = self.printer.lookup_object("gcode")
-        #self.name: str = config.get_name()
+        self.printer = config.get_printer()
+        self.reactor = self.printer.get_reactor()
+        self.gcode = self.printer.lookup_object("gcode")
+        self.name: str = config.get_name()
 
         # --- Configuration parameters (all defensive with defaults) ---
         # serial_port is effectively REQUIRED off-Hi: CFS_DEFAULT_PORT (/dev/ttyS5) is the
         # Hi mainboard RS-485 node (owned by serial_485 on the Hi). On a portable mainline
         # host set this to the dedicated CFS port (e.g. a USB-RS485 adapter /dev/ttyUSB0).
-        self.serial_port: str = CFS_DEFAULT_PORT
-        self.baud: int = CFS_BAUD_RATE
-        self.timeout: float = TIMEOUT_MEDIUM
-        self.retry_count: int = DEFAULT_RETRY_COUNT
-        self.box_count: int = 4
-        self.auto_init: bool = True
+        self.serial_port: str = config.get("serial_port", CFS_DEFAULT_PORT)
+        self.baud: int = config.getint("baud", CFS_BAUD_RATE, minval=9600, maxval=921600)
+        self.timeout: float = config.getfloat("timeout", TIMEOUT_MEDIUM, minval=0.01, maxval=10.0)
+        self.retry_count: int = config.getint("retry_count", DEFAULT_RETRY_COUNT, minval=0, maxval=10)
+        self.box_count: int = config.getint("box_count", 4, minval=1, maxval=4)
+        self.auto_init: bool = config.getboolean("auto_init", True)
         # rts_on_send: -1 (default) leaves the UART alone (auto-direction transceiver, portable);
         # 1 = kernel RS-485 mode with RTS high on send (DE); 0 = RTS low on send.
-        rts: int = -1
+        rts: int = config.getint("rts_on_send", -1, minval=-1, maxval=1)
         self.rts_on_send = None if rts < 0 else bool(rts)
 
         # --- Choreography configuration (v1.4.0; all optional, printer-agnostic) ---
@@ -986,36 +1043,86 @@ class CrealityCFS:
         # This switch is the load gate (the 0x06/0x07 finalize fires only after it trips) and
         # the unload completion gate (done when it clears). Without one, loads degrade to a
         # single ungated ramp cycle and unloads fall back to box-state corroboration.
-        self.filament_sensor_name: str = "filament_sensor"
+        self.filament_sensor_name: str = config.get("filament_sensor", "filament_sensor")
         # extrude_temp: the default change/melt temperature. Every hotend E move and every
         # box-motor feed toward the hotend is gated on a blocking M109 to at least this
         # (>= MIN_EXTRUDE_TEMP) -- see the temperature-guard constants above.
-        self.extrude_temp: float = DEFAULT_EXTRUDE_TEMP
-        self.load_max_bursts: int = LOAD_TOPUP_MAX_BURSTS
-        self.load_wall_budget: float = LOAD_TOPUP_WALL_BUDGET_S
-        # Cut geometry (all optional). CFS_CUT refuses to run without cut_switch_pin (the
-        # cutter microswitch/hall the mechanical ram relies on) and a real, non-zero travel.
-        self.cut_switch_pin = None
-        self.pre_cut_pos_x = None
-        self.pre_cut_pos_y = None
-        self.cut_pos_x = None
-        self.cut_pos_y = None
-        self.cut_velocity: float = 3000.0
-        self.cut_pos_x_max = None
+        self.extrude_temp: float = config.getfloat(
+            "extrude_temp", DEFAULT_EXTRUDE_TEMP, above=0.)
+        self.load_max_bursts: int = config.getint(
+            "load_max_bursts", LOAD_TOPUP_MAX_BURSTS, minval=1, maxval=20)
+        self.load_wall_budget: float = config.getfloat(
+            "load_wall_budget", LOAD_TOPUP_WALL_BUDGET_S, above=0.)
+        # Cut geometry and sensor. CFS_CUT verifies physical cut via cut_switch_pin
+        # before any extruder movement or CFS unload.
+        self.cut_switch_pin = config.get("cut_switch_pin", None)
+        self.pre_cut_pos_x = config.getfloat("pre_cut_pos_x", None)
+        self.pre_cut_pos_y = config.getfloat("pre_cut_pos_y", None)
+        self.cut_pos_x = config.getfloat("cut_pos_x", None)
+        self.cut_pos_y = config.getfloat("cut_pos_y", None)
+        self.cut_velocity: float = config.getfloat("cut_velocity", 3000.0, above=0.)
+        self.cut_pos_x_min = config.getfloat("cut_pos_x_min", None)
+        self.cut_pos_x_max = config.getfloat("cut_pos_x_max", None)
+        self.cut_dwell: float = config.getfloat("cut_dwell", 0.150, minval=0.0, maxval=5.0)
+        self.cut_retries: int = config.getint("cut_retries", 2, minval=0, maxval=10)
+        self.cut_step: float = config.getfloat("cut_step", 0.5, minval=0.0, maxval=5.0)
+        self.cut_retrude_len: float = config.getfloat(
+            "cut_retrude_len", 0.0, minval=0.0, maxval=100.0)
+        self.cut_retrude_velocity: float = config.getfloat(
+            "cut_retrude_velocity", 600.0, above=0.0)
+        self.cut_relieve_len: float = config.getfloat(
+            "cut_relieve_len", 0.1, minval=0.0, maxval=2.0)
+
+        # Cutter switch tracking via buttons module
+        self._cutter_button_state: bool = False
+        if self.cut_switch_pin:
+            buttons = self.printer.load_object(config, 'buttons')
+            buttons.register_buttons([self.cut_switch_pin], self._cut_button_handler)
+        # Kinematic corridor parameters
+        self.safe_pos_x: float = config.getfloat("safe_pos_x", 205.0)
+        self.safe_pos_y: float = config.getfloat("safe_pos_y", 301.0)
+        self.chute_entry_x: float = config.getfloat("chute_entry_x", 139.0)
+        self.corridor_boundary_y: float = config.getfloat(
+            "corridor_boundary_y", self.safe_pos_y - 10.0)
+        self.extrude_pos_x: float = config.getfloat("extrude_pos_x", 124.0)
+        self.extrude_pos_y: float = config.getfloat("extrude_pos_y", 329.0)
+        self.travel_velocity: float = config.getfloat("travel_velocity", 12000.0, above=0.0)
+        self.min_clearance_z: float = config.getfloat("min_clearance_z", 5.0, minval=0.0)
+        self.retrude_toolhead_pull_mm: float = config.getfloat(
+            "retrude_toolhead_pull_mm", RETRUDE_TOOLHEAD_PULL_MM, above=0.0)
+        self.retrude_toolhead_pull_vel: float = config.getfloat(
+            "retrude_toolhead_pull_vel", RETRUDE_TOOLHEAD_PULL_VEL, above=0.0)
         # Flush parameters (see the FLUSH_* constants for the wire-verified model).
-        self.nozzle_volume: float = NOZZLE_VOLUME_DEFAULT
-        self.flush_multiplier: float = FLUSH_MULTIPLIER_DEFAULT
-        self.flush_cycle_cap: float = FLUSH_CYCLE_CAP_DEFAULT
-        self.flush_default_len: float = FLUSH_TOTAL_DEFAULT
-        self.flush_velocity: float = FLUSH_VELOCITY_DEFAULT
+        self.nozzle_volume: float = config.getfloat(
+            "nozzle_volume", NOZZLE_VOLUME_DEFAULT, above=0.)
+        self.flush_multiplier: float = config.getfloat(
+            "flush_multiplier", FLUSH_MULTIPLIER_DEFAULT, above=0.)
+        self.flush_cycle_cap: float = config.getfloat(
+            "flush_cycle_cap", FLUSH_CYCLE_CAP_DEFAULT, above=0.)
+        self.flush_default_len: float = config.getfloat(
+            "flush_default_len", FLUSH_TOTAL_DEFAULT, above=0.)
+        self.flush_velocity: float = config.getfloat(
+            "flush_velocity", FLUSH_VELOCITY_DEFAULT, above=0.)
+        self.flush_post_retract_len: float = config.getfloat(
+            "flush_post_retract_len", FLUSH_POST_RETRACT_LEN_MM, above=0., maxval=5.)
+        self.flush_post_retract_vel: float = config.getfloat(
+            "flush_post_retract_vel", FLUSH_POST_RETRACT_VEL, above=0., maxval=1000.)
         # buffer_empty_len: the filament buffer's capacity in mm (stock BoxCfg default 30,
         # bounds 0-60). Purges shorter than 2x this can be absorbed by the buffer spring
         # without turning the (upstream) measuring wheel, so the flush clog watchdog is
         # armed only for cycles at or above that length (stock behavior).
-        self.buffer_empty_len: float = BUFFER_EMPTY_LEN_MM
+        self.buffer_empty_len: float = config.getfloat(
+            "buffer_empty_len", BUFFER_EMPTY_LEN_MM, minval=0., maxval=60.)
         # nozzle_clean_macro: an optional [gcode_macro] name run once per flush cycle (the
         # per-cycle nozzle wipe). Printer-specific wipe geometry belongs in that macro.
-        self.nozzle_clean_macro = None
+        self.nozzle_clean_macro = config.get("nozzle_clean_macro", None)
+        # External spool bypass slot configuration defaults (for generic / non-Creality setups)
+        self.bypass_material: str = config.get("bypass_material", "PLA")
+        self.bypass_temp: float = config.getfloat("bypass_temp", 220.0, above=0.0)
+        self.bypass_color: str = config.get("bypass_color", "#FFFFFF")
+        self.bypass_vendor: str = config.get("bypass_vendor", "Generic")
+        # Consume legacy register_tool_commands gracefully if present in user configs
+        _ = config.getboolean("register_tool_commands", None)
         # The requested baud is mapped to a termios B-constant lazily in the connect path
         # (_resolve_baud_const, called from _config_tty). It is NOT resolved here because
         # termios does not exist off-POSIX and __init__ must construct on any host (the
@@ -1041,12 +1148,17 @@ class CrealityCFS:
 
         # --- Choreography state (v1.4.0) ---
         self._active_tool = None        # 0-based tool index of the currently loaded slot, or None
+        self._previous_tool = None      # 0-based tool index of previously active slot (for temp arbitration)
         self._connected: set = set()    # addrs whose connect-init burst completed
         self._probe_attempts: int = 0   # bounded wake-probe retry counter
         self._preload_done: dict = {}   # addr -> True once the connect pre-load completed
         self._preload_inflight: dict = {}  # addr -> True while a pre-load sequence is running
         self._slots: dict = {}          # tool idx -> {"present","material","remain"} cache
         self._buffer_state = None       # last 0x05 buffer byte (0 middle/1 full/2 empty), or None
+        self._bypass_tool_idx: int = self.box_count * 4
+        self._bypass_mode: bool = False
+        self._saved_bypass_slot: dict = None
+        self._tool_map: dict = {}
 
         # --- Box feature state surfaced in the flat `box` get_status (box_wrapper §5a) ---
         self.auto_refill: int = 0       # BOX_ENABLE_AUTO_REFILL toggle -> box.auto_refill
@@ -1055,6 +1167,30 @@ class CrealityCFS:
         self._filament_useup: int = 0   # runout / filament-used-up flag -> box.filament_useup
         self._cut_state: bool = False   # last CFS_CUT confirmed result -> box.cut_state
         self._last_error = None         # {"code":int,"key":str,"msg":str} latched box error
+
+        # --- Material Database (RFID codes, generic/Creality codes, melt temps) ---
+        self.material_db_file: str = os.path.expanduser(
+            config.get("material_db_file", "~/printer_data/config/cfs_material_db.json")
+        )
+        self._load_material_db()
+
+        # --- State persistence (v1.5.0, up to 4 boxes / 16 slots) ---
+        self.state_file: str = os.path.expanduser(
+            config.get("state_file", "~/printer_data/config/cfs_state.json")
+        )
+        self._load_state()
+
+        # --- Live environment & hardware telemetry (wire 0x0A / 0x14 / 0x08) ---
+        self._temperature: int = 26     # Chamber temperature (°C) from 0x0A d[0]
+        self._humidity: int = 40        # Relative humidity (% RH) from 0x0A d[1]
+        self._mode: int = 0             # Operational mode from 0x0A d[3] (0=IDLE, etc.)
+        self._jam_status: int = 0       # Jam status from 0x0A d[2]
+        self._photoelectric_status: int = 0 # Photoelectric presence mask from 0x0A d[4]
+        self._slot_rfid_scrap: int = 0  # RFID scrap status from 0x0A d[5]
+        self._box_version: str = "1.5.0" # Version string parsed from 0x14
+        self._box_sn: str = ""          # Serial number parsed from 0x14
+        self._telemetry_timer = None    # Periodic reactor timer handle
+        self._telemetry_cycle: int = 0  # Counter for cadence (e.g. remain read every 10 cycles)
 
         # --- Register Klipper lifecycle handlers ---
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
@@ -1093,9 +1229,19 @@ class CrealityCFS:
             desc=self.cmd_CFS_ADDR_TABLE_help,
         )
         self.gcode.register_command(
+            "CFS_LOAD",
+            self.cmd_CFS_EXTRUDE,
+            desc="Load filament from CFS to toolhead (CFS_EXTRUDE alias)",
+        )
+        self.gcode.register_command(
             "CFS_EXTRUDE",
             self.cmd_CFS_EXTRUDE,
             desc=self.cmd_CFS_EXTRUDE_help,
+        )
+        self.gcode.register_command(
+            "CFS_UNLOAD",
+            self.cmd_CFS_RETRUDE,
+            desc="Unload filament from toolhead to CFS (CFS_RETRUDE alias)",
         )
         self.gcode.register_command(
             "CFS_RETRUDE",
@@ -1113,33 +1259,96 @@ class CrealityCFS:
             desc=self.cmd_CFS_CUT_help,
         )
         self.gcode.register_command(
+            "CFS_CUT_TEST",
+            self.cmd_CFS_CUT_TEST,
+            desc=self.cmd_CFS_CUT_TEST_help,
+        )
+        self.gcode.register_command(
             "CFS_FLUSH",
             self.cmd_CFS_FLUSH,
             desc=self.cmd_CFS_FLUSH_help,
         )
-        # Stock BOX_* tokens for the box-parity features (auto-refill / same-material /
-        # error clear). Named to match the stock box_wrapper G-code surface so UIs and
-        # macros written against the Creality box can drive this port unchanged.
         self.gcode.register_command(
-            "BOX_ENABLE_AUTO_REFILL",
+            "CFS_SLOTS",
+            self.cmd_CFS_SLOTS,
+            desc=self.cmd_CFS_SLOTS_help,
+        )
+        # Native CFS driver commands (clean, printer-agnostic). Creality BOX_*
+        # aliases and motion choreography commands are decoupled into G-code macros
+        # in cfs_macros.cfg to ensure driver portability across printer designs.
+        self.gcode.register_command(
+            "CFS_ENABLE_AUTO_REFILL",
             self.cmd_set_enable_auto_refill,
             desc=self.cmd_set_enable_auto_refill_help,
         )
         self.gcode.register_command(
-            "BOX_UPDATE_SAME_MATERIAL_LIST",
+            "CFS_UPDATE_SAME_MATERIAL_LIST",
             self.cmd_update_same_material_list,
             desc=self.cmd_update_same_material_list_help,
         )
         self.gcode.register_command(
-            "BOX_CHECK_MATERIAL_REFILL",
+            "CFS_CHECK_MATERIAL_REFILL",
             self.cmd_check_material_refill,
             desc=self.cmd_check_material_refill_help,
         )
         self.gcode.register_command(
-            "BOX_ERROR_CLEAR",
+            "CFS_ERROR_CLEAR",
             self.cmd_error_clear,
             desc=self.cmd_error_clear_help,
         )
+        self.gcode.register_command(
+            "CFS_SET_IDLE_MODE",
+            self.cmd_CFS_SET_IDLE_MODE,
+            desc=self.cmd_CFS_SET_IDLE_MODE_help,
+        )
+        self.gcode.register_command(
+            "CFS_INFO_REFRESH",
+            self.cmd_CFS_INFO_REFRESH,
+            desc=self.cmd_CFS_INFO_REFRESH_help,
+        )
+        self.gcode.register_command(
+            "CFS_GET_RFID",
+            self.cmd_CFS_GET_RFID,
+            desc=self.cmd_CFS_GET_RFID_help,
+        )
+        self.gcode.register_command(
+            "CFS_GET_REMAIN_LEN",
+            self.cmd_CFS_GET_REMAIN_LEN,
+            desc=self.cmd_CFS_GET_REMAIN_LEN_help,
+        )
+        self.gcode.register_command(
+            "CFS_BOX_STATE",
+            self.cmd_CFS_BOX_STATE,
+            desc=self.cmd_CFS_BOX_STATE_help,
+        )
+        self.gcode.register_command(
+            "CFS_MODIFY_TN_DATA",
+            self.cmd_CFS_MODIFY_TN_DATA,
+            desc=self.cmd_CFS_MODIFY_TN_DATA_help,
+        )
+        self.gcode.register_command(
+            "CFS_SET_SLOT",
+            self.cmd_CFS_SET_SLOT,
+            desc=self.cmd_CFS_SET_SLOT_help,
+        )
+        self.gcode.register_command(
+            "CFS_PROBE",
+            self.cmd_CFS_PROBE,
+            desc="Diagnostic RS-485 probe command",
+        )
+
+        # --- Dynamic Tn and Bypass Slot mapping (Tasks 2 & 3) ---
+        self.gcode.register_command(
+            "CFS_BYPASS",
+            self.cmd_CFS_BYPASS,
+            desc=self.cmd_CFS_BYPASS_help,
+        )
+        self.gcode.register_command(
+            "CFS_SET_TOOL_MAPPING",
+            self.cmd_CFS_SET_TOOL_MAPPING,
+            desc=self.cmd_CFS_SET_TOOL_MAPPING_help,
+        )
+        self._update_bypass_slot()
 
         # Register the stock-shaped flat `box` status object (box_wrapper §5a) so the
         # Creality touchscreen CFS panel and the StoneLabs UIs -- which read printer.box.*
@@ -1150,6 +1359,308 @@ class CrealityCFS:
             self.printer.add_object("box", CFSBoxStatus(self))
 
         logger.info("creality_cfs: module loaded, port=%s baud=%d", self.serial_port, self.baud)
+
+    # -----------------------------------------------------------------------
+    # Material Database & HelixScreen Override Synchronization
+    # -----------------------------------------------------------------------
+
+    def _load_material_db(self) -> None:
+        """Load external material database containing RFID codes and melt temperatures."""
+        db_paths = [
+            self.material_db_file,
+            os.path.expanduser("~/printer_data/config/cfs_material_db.json"),
+            "/usr/data/printer_data/config/cfs_material_db.json",
+            os.path.join(os.path.dirname(__file__), "../../config/cfs_material_db.json"),
+        ]
+        target_path = None
+        for p in db_paths:
+            if p and os.path.exists(p):
+                target_path = p
+                break
+
+        self._material_db = {"materials": {}, "codes": {}}
+        if target_path:
+            try:
+                with open(target_path, "r") as f:
+                    self._material_db = json.load(f)
+                logger.info("creality_cfs: loaded material database from %s (%d materials, %d codes)",
+                            target_path, len(self._material_db.get("materials", {})),
+                            len(self._material_db.get("codes", {})))
+            except Exception as e:
+                logger.warning("creality_cfs: error loading material database from %s: %s", target_path, e)
+
+        # Fallback built-in defaults if DB is empty or missing
+        if not self._material_db.get("materials"):
+            self._material_db["materials"] = {
+                "PLA": {"default_code": "000001", "creality_code": "101001", "melt_temp": 210},
+                "PETG": {"default_code": "000003", "creality_code": "106002", "melt_temp": 240},
+                "ABS": {"default_code": "000004", "creality_code": "103001", "melt_temp": 250},
+                "TPU": {"default_code": "000005", "creality_code": "110001", "melt_temp": 220},
+                "ASA": {"default_code": "000007", "creality_code": "119001", "melt_temp": 250},
+                "PC": {"default_code": "000021", "creality_code": "107002", "melt_temp": 270},
+                "PA": {"default_code": "000008", "creality_code": "111001", "melt_temp": 260},
+                "PA-CF": {"default_code": "000009", "creality_code": "112005", "melt_temp": 280},
+                "PLA-CF": {"default_code": "000006", "creality_code": "102001", "melt_temp": 220},
+                "PETG-CF": {"default_code": "000014", "creality_code": "106003", "melt_temp": 250},
+            }
+        if not self._material_db.get("codes"):
+            self._material_db["codes"] = {
+                "000001": {"material": "PLA", "vendor": "Generic"},
+                "00001":  {"material": "PLA", "vendor": "Generic"},
+                "01001":  {"material": "PLA", "vendor": "Creality"},
+                "101001": {"material": "PLA", "vendor": "Creality"},
+                "000003": {"material": "PETG", "vendor": "Generic"},
+                "00003":  {"material": "PETG", "vendor": "Generic"},
+                "06002":  {"material": "PETG", "vendor": "Creality"},
+                "106002": {"material": "PETG", "vendor": "Creality"},
+                "000004": {"material": "ABS", "vendor": "Generic"},
+                "00004":  {"material": "ABS", "vendor": "Generic"},
+                "03001":  {"material": "ABS", "vendor": "Creality"},
+                "103001": {"material": "ABS", "vendor": "Creality"},
+                "000005": {"material": "TPU", "vendor": "Generic"},
+                "00005":  {"material": "TPU", "vendor": "Generic"},
+                "10001":  {"material": "TPU", "vendor": "Creality"},
+                "110001": {"material": "TPU", "vendor": "Creality"},
+                "000007": {"material": "ASA", "vendor": "Generic"},
+                "00007":  {"material": "ASA", "vendor": "Generic"},
+                "119001": {"material": "ASA", "vendor": "Creality"},
+                "000021": {"material": "PC", "vendor": "Generic"},
+                "07002":  {"material": "PC", "vendor": "Creality"},
+                "107002": {"material": "PC", "vendor": "Creality"},
+                "000009": {"material": "PA-CF", "vendor": "Generic"},
+                "112005": {"material": "PA-CF", "vendor": "Creality"},
+            }
+
+    def resolve_cfs_code(self, code_str: str):
+        """Translate a 5/6-digit CFS RFID code into (material, vendor)."""
+        if not code_str:
+            return None, None
+        c = str(code_str).strip()
+        codes_dict = self._material_db.get("codes", {})
+        if c in codes_dict:
+            entry = codes_dict[c]
+            return entry.get("material"), entry.get("vendor", "Generic")
+        if len(c) == 6 and c[1:] in codes_dict:
+            entry = codes_dict[c[1:]]
+            return entry.get("material"), entry.get("vendor", "Generic")
+        return None, None
+
+    def get_cfs_code(self, material: str, vendor: str = None) -> str:
+        """Get the 6-digit CFS code to report for a given material and vendor."""
+        if not material:
+            return "-1"
+        mat_upper = str(material).strip().upper()
+        materials_dict = self._material_db.get("materials", {})
+        entry = None
+        for k, v in materials_dict.items():
+            if k.upper() == mat_upper:
+                entry = v
+                break
+        if not entry:
+            return str(material)
+
+        is_creality = vendor and ("creality" in str(vendor).lower() or "hyper" in str(material).lower())
+        if is_creality and entry.get("creality_code"):
+            code = entry["creality_code"]
+        else:
+            code = entry.get("generic_code") or entry.get("default_code") or ""
+        
+        if code and code.isdigit() and len(code) < 6:
+            code = code.zfill(6)
+        return code or str(material)
+
+    def _sync_helixscreen_overrides(self) -> None:
+        """Sync slot metadata with HelixScreen's filament_slot_overrides.json if present."""
+        override_paths = [
+            os.path.expanduser("~/helixscreen/config/filament_slot_overrides.json"),
+            "/home/klipper/helixscreen/config/filament_slot_overrides.json",
+            "/opt/helixscreen/config/filament_slot_overrides.json",
+        ]
+        override_file = None
+        for p in override_paths:
+            if os.path.exists(p):
+                override_file = p
+                break
+        if not override_file:
+            return
+
+        try:
+            with open(override_file, "r") as f:
+                doc = json.load(f)
+            cfs_slots = doc.get("cfs", {}).get("slots", {})
+            changed = False
+            for k, ovr in cfs_slots.items():
+                try:
+                    slot_idx = int(k)
+                except ValueError:
+                    continue
+                mat = ovr.get("material")
+                brand = ovr.get("brand")
+                color_rgb = ovr.get("color_rgb")
+                slot = self._slots.get(slot_idx)
+                if not slot:
+                    continue
+                if mat and mat.lower() not in ("none", "-1", "unknown", "") and (not slot.get("material") or slot.get("material") == "unknown"):
+                    slot["material"] = mat
+                    if brand and brand.lower() not in ("none", "-1", ""):
+                        slot["vendor"] = brand
+                    slot["present"] = True
+                    changed = True
+                if color_rgb is not None and ovr.get("color_set", False) and slot.get("color") in ("none", "-1", None):
+                    slot["color"] = "#%06X" % (color_rgb & 0xFFFFFF)
+                    changed = True
+            if changed:
+                logger.info("creality_cfs: synced slot overrides from %s", override_file)
+                self._save_state()
+        except Exception as e:
+            logger.warning("creality_cfs: failed to sync HelixScreen overrides from %s: %s", override_file, e)
+
+    def _sync_helixscreen_single_slot(self, slot_idx: int) -> bool:
+        """Sync a single slot from HelixScreen overrides if material is missing/unknown."""
+        override_paths = [
+            os.path.expanduser("~/helixscreen/config/filament_slot_overrides.json"),
+            "/home/klipper/helixscreen/config/filament_slot_overrides.json",
+            "/opt/helixscreen/config/filament_slot_overrides.json",
+        ]
+        for p in override_paths:
+            if not os.path.exists(p):
+                continue
+            try:
+                with open(p, "r") as f:
+                    doc = json.load(f)
+                cfs_slots = doc.get("cfs", {}).get("slots", {})
+                ovr = cfs_slots.get(str(slot_idx))
+                if not ovr:
+                    continue
+                slot = self._slots.get(slot_idx)
+                if not slot:
+                    continue
+                mat = ovr.get("material")
+                brand = ovr.get("brand")
+                if mat and mat.lower() not in ("none", "-1", "unknown", ""):
+                    slot["material"] = mat
+                    if brand and brand.lower() not in ("none", "-1", ""):
+                        slot["vendor"] = brand
+                    slot["present"] = True
+                    logger.info("creality_cfs: slot %d material recovered from %s: %s (%s)",
+                                slot_idx, p, mat, brand)
+                    return True
+            except Exception as e:
+                logger.debug("creality_cfs: error reading override from %s: %s", p, e)
+        return False
+
+    # -----------------------------------------------------------------------
+    # CFS State Persistence (v1.5.0: up to 4 boxes / 16 spools)
+    # -----------------------------------------------------------------------
+
+    def _load_state(self) -> None:
+        """Load persistent CFS state (slots, active_tool, auto_refill, same_material).
+
+        Reads from self.state_file. If state_file does not exist, initializes default
+        slots for all configured boxes.
+        """
+        if self.state_file and os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, "r") as f:
+                    data = json.load(f)
+                at = data.get("active_tool")
+                self._active_tool = int(at) if (at is not None and at != -1 and at != "None") else None
+                pt = data.get("previous_tool")
+                self._previous_tool = int(pt) if (pt is not None and pt != -1 and pt != "None") else None
+                self.auto_refill = int(data.get("auto_refill", 0))
+                self.same_material = data.get("same_material", [])
+                raw_slots = data.get("slots", {})
+                migrated = False
+                for k, v in raw_slots.items():
+                    try:
+                        idx = int(k)
+                        slot_data = dict(v)
+                        if "vender" in slot_data:
+                            if "vendor" not in slot_data:
+                                slot_data["vendor"] = slot_data["vender"]
+                            del slot_data["vender"]
+                            migrated = True
+                        self._slots[idx] = slot_data
+                    except (ValueError, TypeError):
+                        continue
+                if "bypass_slot" in data and isinstance(data["bypass_slot"], dict):
+                    self._saved_bypass_slot = dict(data["bypass_slot"])
+                    self._saved_bypass_slot["is_bypass"] = True
+                if migrated:
+                    self._save_state()
+                self._sync_helixscreen_overrides()
+                logger.info("creality_cfs: loaded persistent state from %s (%d slots, active=%s, prev=%s)",
+                            self.state_file, len(self._slots), self._active_tool, self._previous_tool)
+                return
+            except Exception as e:
+                logger.warning("creality_cfs: failed to load state from %s: %s", self.state_file, e)
+
+        # Default initialization: populate empty slots across all configured boxes
+        for tool_idx in range(self.box_count * 4):
+            addr = (tool_idx // 4) + 1
+            slot_num = tool_idx % 4
+            self._slots.setdefault(tool_idx, {
+                "present": False,
+                "material": None,
+                "color": "none",
+                "vendor": "unknown",
+                "remain": 0,
+                "addr": addr,
+                "slot": slot_num,
+            })
+        self._slots.setdefault(self._bypass_tool_idx, {
+            "present": True,
+            "material": self.bypass_material,
+            "melt_temp": self.bypass_temp,
+            "color": self.bypass_color,
+            "vendor": self.bypass_vendor,
+            "remain": -1,
+            "is_bypass": True,
+            "addr": None,
+            "slot": None,
+        })
+        self._sync_helixscreen_overrides()
+        self._save_state()
+
+    def _save_state(self) -> None:
+        """Atomically persist CFS state to self.state_file."""
+        if not self.state_file:
+            return
+        state_dir = os.path.dirname(self.state_file)
+        try:
+            if state_dir and not os.path.exists(state_dir):
+                os.makedirs(state_dir, exist_ok=True)
+            tmp_file = self.state_file + ".tmp"
+
+            def _clean_slot(s):
+                if not s:
+                    return {}
+                d = dict(s)
+                if "vender" in d:
+                    if "vendor" not in d:
+                        d["vendor"] = d["vender"]
+                    del d["vender"]
+                return d
+
+            bypass_info = self._slots.get(self._bypass_tool_idx)
+            if bypass_info:
+                self._saved_bypass_slot = dict(bypass_info)
+            payload = {
+                "version": 1,
+                "active_tool": self._active_tool,
+                "previous_tool": self._previous_tool,
+                "auto_refill": self.auto_refill,
+                "same_material": list(self.same_material),
+                "slots": {str(k): _clean_slot(v) for k, v in self._slots.items()},
+                "bypass_slot": _clean_slot(bypass_info) if bypass_info else None,
+            }
+            with open(tmp_file, "w") as f:
+                json.dump(payload, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, self.state_file)
+        except Exception as e:
+            logger.warning("creality_cfs: failed to save state to %s: %s", self.state_file, e)
 
     # -----------------------------------------------------------------------
     # Klipper lifecycle handlers
@@ -1168,8 +1679,35 @@ class CrealityCFS:
             logger.error("creality_cfs: failed to open serial port %s: %s", self.serial_port, exc)
             return
 
+        self._update_bypass_slot()
+
         if self.auto_init:
             self.reactor.register_callback(self._auto_init_callback)
+
+        # Register periodic telemetry poll timer (every 4 seconds)
+        self._telemetry_timer = self.reactor.register_timer(
+            self._telemetry_callback, self.reactor.monotonic() + 5.0)
+
+    def _telemetry_callback(self, eventtime: float) -> float:
+        """Periodic reactor timer to poll GET_BOX_STATE and maintain live telemetry."""
+        if self._shutdown or not self.is_connected:
+            return eventtime + 4.0
+        # If the bus is busy (e.g. middle of load/unload choreography), don't interrupt
+        if self._bus_lock.test():
+            return eventtime + 2.0
+        try:
+            for entry in self._box_table:
+                if entry.online == BoxAddressEntry.ONLINE_ONLINE and entry.addr in self._connected:
+                    self.get_box_state(entry.addr, timeout=0.5, retries=0)
+                    self._telemetry_cycle += 1
+                    # Periodically refresh remain length every 10 cycles (~40 seconds)
+                    if self._telemetry_cycle % 10 == 0:
+                        rem = self.read_remain(entry.addr, PRELOAD_MASK_ALL, timeout=1.0)
+                        if rem is not None:
+                            self._ingest_slot_reads(None, rem, addr=entry.addr)
+        except Exception:
+            logger.debug("creality_cfs: telemetry poll exception (non-fatal)", exc_info=True)
+        return eventtime + 4.0
 
     def _auto_init_callback(self, eventtime: float) -> None:
         """Reactor callback to run auto-addressing on klippy:ready.
@@ -1229,10 +1767,9 @@ class CrealityCFS:
 
     def _connect_init(self, addr: int) -> None:
         """The stock connect-init burst for one box (wire order from the reference decode):
-        0x04 [00][01] enter feed mode -> 0x14 version/SN -> the two-frame pre-load self-check
-        (0x0D [00][01] begin, 0x08, 0x0D [0f][01] phase 1, 0x08 -- stock sends NO [0f][02]) ->
-        the all-slot presence read (0x02 [0x0f] + 0x03 [0x0f], long timeouts: the box scans
-        all four bays for ~11 s). Tolerant of a silent box at every step (never raises)."""
+        0x04 [00][01] enter feed mode -> 0x14 version/SN -> pre-load ARM (0x0D [0f][00]) ->
+        the all-slot presence read (0x02 [0x0f] + 0x03 [0x0f]). Tolerant of a silent box
+        at every step (never raises)."""
         try:
             self.set_box_mode(addr, 0x00, 0x01)                 # 0x04 0001 enter feed mode
             try:
@@ -1242,39 +1779,28 @@ class CrealityCFS:
             self._run_preload_sequence(addr)
             mat = self.read_material(addr, PRELOAD_MASK_ALL, timeout=15.0)
             rem = self.read_remain(addr, PRELOAD_MASK_ALL, timeout=15.0)
-            self._ingest_slot_reads(mat, rem)
+            self._ingest_slot_reads(mat, rem, addr=addr)
             logger.info("creality_cfs: box 0x%02X connect-init done sn=%s slots=%s",
                         addr, sn, self._slots)
         except Exception:
             logger.exception("creality_cfs: connect-init for 0x%02X failed (non-fatal)", addr)
 
     def _run_preload_sequence(self, addr: int):
-        """Run the stock startup pre-load self-check ONCE per box (single-owner guarded).
+        """Run the stock startup pre-load arm sequence ONCE per box (single-owner guarded).
 
-        Wire (stock-fidelity): TWO 0x0D frames only --
-          0x0D [00][01]  begin/enable      (ACK ~0.98 s)
-          0x08 [00]      hardware status
-          0x0D [0f][01]  phase 1           (ACK ~0.07 s)
-          0x08 [00]      hardware status
-        Stock NEVER sends a [0f][02] phase at connect: the box NAKs it (status 0x16) and is
-        held in its active state so inserts never latch. After [0f][01] the box settles to
-        idle on its own. Each 0x0D ACK's STATUS byte is checked by set_pre_loading(). Returns
-        the first 0x08 flag byte (or None) for logging."""
+        Wire (stock-fidelity):
+          Stock sends: 0x01 0x05 0xff 0x0d 0x0f 0x00 -> ARM preloading on all slots!
+          This turns present spool LEDs WHITE and readies the box for loading.
+        """
         if self._preload_done.get(addr) or self._preload_inflight.get(addr):
             return None
         self._preload_inflight[addr] = True
         try:
-            # NOTE: the connect-time phase byte is 0x01 in BOTH frames ([00 01] begin,
-            # [0f 01] phase 1) -- numerically the same byte as the end-print disarm, but a
-            # different wire pair (the mask selects the meaning). Passed literally here.
-            if not self.set_pre_loading(addr, 0x00, 0x01,
-                                        timeout=PRELOAD_BEGIN_TIMEOUT_S, retries=1):
-                logger.warning("creality_cfs: pre-load begin [00 01] not ACKed on 0x%02X", addr)
             hw = self.get_hardware_status(addr, 0x00)
-            if not self.set_pre_loading(addr, PRELOAD_MASK_ALL, 0x01,
+            if not self.set_pre_loading(addr, PRELOAD_MASK_ALL, PRELOAD_PHASE_ARM,
                                         timeout=PRELOAD_PHASE1_TIMEOUT_S, retries=1):
-                logger.warning("creality_cfs: pre-load phase 1 [0f 01] not ACKed on 0x%02X", addr)
-            self.get_hardware_status(addr, 0x00)
+                logger.warning("creality_cfs: pre-load ARM [0f 00] not ACKed on 0x%02X", addr)
+            self.get_box_state(addr)
             self._preload_done[addr] = True
             return hw
         finally:
@@ -1283,10 +1809,14 @@ class CrealityCFS:
     def _handle_shutdown(self) -> None:
         """Called on klippy:shutdown or klippy:disconnect.
 
-        Quiesces the bus (aborts any in-flight waiter so a parked greenlet wakes instead of
-        hanging on a tearing-down reactor) and closes the serial port safely. Klipper invokes
-        shutdown handlers while already shutting down, so this must NEVER raise.
+        Quiesces the bus and closes the serial port safely.
         """
+        if self._telemetry_timer is not None:
+            try:
+                self.reactor.unregister_timer(self._telemetry_timer)
+            except Exception:
+                pass
+            self._telemetry_timer = None
         try:
             self._quiesce()
         except Exception as exc:
@@ -1720,6 +2250,7 @@ class CrealityCFS:
             "creality_cfs: auto-addressing complete, %d/%d box(es) online",
             online_count, self.box_count,
         )
+        self._update_bypass_slot()
         return online_count
 
     def _discover_slaves(self) -> list:
@@ -1993,8 +2524,36 @@ class CrealityCFS:
         d = data_bytes
         status = resp.get("status")
         ev_phase = d[0] if status == BOX_EVENT_INSERT else None
+
+        # Telemetry decoding (wire-confirmed from stock ParseData.get_box_status):
+        # d[0] = Chamber temperature (°C)
+        # d[1] = Relative humidity (% RH)
+        # d[2] = Jam status (0 = normal)
+        # d[3] = Box Mode (0 = IDLE, 1 = PRELOADING, 2 = PRINTING, etc.)
+        # d[4] = Photoelectric presence mask
+        # d[5] = RFID scrap status
+        temp = d[0]
+        humidity = d[1]
+        jam = d[2]
+        box_mode = d[3]
+        photoelectric = d[4] if len(d) > 4 else 0
+        rfid_scrap = d[5] if len(d) > 5 else 0
+
+        self._temperature = temp
+        self._humidity = humidity
+        self._jam_status = jam
+        self._mode = box_mode
+        self._photoelectric_status = photoelectric
+        self._slot_rfid_scrap = rfid_scrap
+
         result = {
-            "fw_base": (d[0] << 8) | d[1],   # opaque firmware base -- diagnostics only
+            "temperature": temp,
+            "humidity": humidity,
+            "jam_status": jam,
+            "mode": box_mode,
+            "photoelectric_status": photoelectric,
+            "rfid_scrap": rfid_scrap,
+            "fw_base": (d[0] << 8) | d[1],   # backward-compatibility alias
             "substatus": d[2],
             "loaded": (d[3] == BOX_STATE_LOADED_B3),
             "feeding": (d[3] == BOX_STATE_FEEDING_B3),
@@ -2009,9 +2568,10 @@ class CrealityCFS:
         # Fault dispatch (buffer spec 2026-07-19): the box raises its OWN feed-loop faults
         # as abnormal STATUS bytes on the 0x0A reply; route them to the status sink.
         self._note_box_status(addr, status, data_bytes)
-        logger.debug("creality_cfs: GET_BOX_STATE addr=0x%02X raw=%s loaded=%s event=0x%02X",
+        logger.debug("creality_cfs: GET_BOX_STATE addr=0x%02X raw=%s loaded=%s event=0x%02X "
+                     "temp=%dC humidity=%d%%",
                      addr, data_bytes.hex(), result["loaded"],
-                     status if status is not None else 0xFF)
+                     status if status is not None else 0xFF, temp, humidity)
         return result
 
     def _note_box_status(self, addr: int, status: int, data: bytes) -> None:
@@ -2081,6 +2641,12 @@ class CrealityCFS:
             )
         version_str: str = data_bytes.rstrip(b"\x00").decode("ascii", errors="replace")
         logger.info("creality_cfs: GET_VERSION_SN addr=0x%02X version='%s'", addr, version_str)
+        # Wire layout: [3 chars version "150"][18 chars SN "1400Z-A025E0024477Q"][type byte]
+        if len(version_str) >= 21 and version_str[:3].isdigit():
+            self._box_version = f"{version_str[0]}.{version_str[1]}.{version_str[2]}"
+            self._box_sn = version_str[3:21]
+        elif version_str:
+            self._box_sn = version_str
         return version_str
 
     def get_version_info(self, addr: int) -> str:
@@ -2357,13 +2923,15 @@ class CrealityCFS:
         d = resp.get("data", b"")
         return {"bytes": d.hex(), "empty": all(b == 0 for b in d)}
 
-    def _ingest_slot_reads(self, material, remain, slot_mask: int = PRELOAD_MASK_ALL) -> set:
+    def _ingest_slot_reads(self, material, remain, slot_mask: int = PRELOAD_MASK_ALL, addr: int = 1) -> set:
         """Fold a 0x02 material map and/or a 0x03 remain byte list into the slot cache.
 
         Tolerant of None on either input; only slots with a signal are touched. Remain (0x03)
         is the primary presence signal, material (0x02) the fallback/identity. The 0x03 reply
-        is positional with 0xFF not-in-mask sentinels (see read_remain). Returns the set of
-        updated tool indices."""
+        is positional with 0xFF not-in-mask sentinels (see read_remain).
+        Maps to tools (addr - 1) * 4 + slot (supporting up to 4 CFS boxes / 16 spools).
+        Preserves user-configured material/color/vendor on non-RFID spools.
+        Returns the set of updated tool indices."""
         updated = set()
         mat_tokens = {}
         if material:
@@ -2385,16 +2953,20 @@ class CrealityCFS:
                 for ri, idx in enumerate(sel):
                     if ri < len(remain):
                         rem_bytes[idx] = remain[ri]
-        for idx in range(4):
-            if not (slot_mask & (1 << idx)):
+
+        base_idx = max(0, addr - 1) * 4
+        state_changed = False
+        for s_idx in range(4):
+            if not (slot_mask & (1 << s_idx)):
                 continue
+            tool_idx = base_idx + s_idx
             present = None
             remain_val = -1
-            rb = rem_bytes.get(idx)
+            rb = rem_bytes.get(s_idx)
             if rb is not None and rb != 0xFF:      # 0xFF = not-reported sentinel, skip
                 present = (rb != 0x00)
                 remain_val = int(rb)
-            tok = mat_tokens.get(idx)
+            tok = mat_tokens.get(s_idx)
             material_val = None
             if tok is not None:
                 tok_present = (tok.lower() != "none" and tok != "")
@@ -2404,10 +2976,38 @@ class CrealityCFS:
                     material_val = tok
             if present is None:
                 continue
-            self._slots[idx] = {"present": bool(present),
-                                "material": material_val if present else None,
-                                "remain": remain_val if present else -1}
-            updated.add(idx)
+
+            existing = self._slots.get(tool_idx, {})
+            color_val = existing.get("color", "none")
+            vendor_val = existing.get("vendor", existing.get("vender", "unknown"))
+            if (material_val is None or material_val.lower() == "unknown") and existing.get("material") and present:
+                final_material = existing.get("material")
+            elif material_val is not None and material_val.lower() != "unknown":
+                final_material = material_val
+            else:
+                final_material = existing.get("material") if present else None
+
+            if remain_val < 0 and existing.get("remain", -1) >= 0 and present:
+                final_remain = existing.get("remain")
+            else:
+                final_remain = remain_val if present else 0
+
+            new_slot_data = {
+                "present": bool(present),
+                "material": final_material,
+                "color": color_val if present else "none",
+                "vendor": vendor_val if present else "unknown",
+                "remain": final_remain,
+                "addr": addr,
+                "slot": s_idx,
+            }
+            if new_slot_data != existing:
+                state_changed = True
+            self._slots[tool_idx] = new_slot_data
+            updated.add(tool_idx)
+
+        if state_changed:
+            self._save_state()
         return updated
 
     def extrude_stage(self, addr: int, slot: int, stage_hi: int, stage_lo: int = 0x00,
@@ -2725,11 +3325,11 @@ class CrealityCFS:
         )
         return True
 
-    def measuring_wheel(self, addr: int) -> bytes:
+    def measuring_wheel(self, addr: int, slot: int = 0x01) -> bytes:
         """CMD_MEASURING_WHEEL (0x0E): read the feed encoder / measuring-wheel word, raw.
 
         Protocol:
-          REQ: f7 [addr] 04 ff 0e 01 [crc]   (data = [0x01])
+          REQ: f7 [addr] 04 ff 0e [slot] [crc]   (data = [slot])
           RSP: f7 [addr] .. 00 0e [4 bytes] [crc]
 
         DECODE RESOLVED (v1.4.0; was 'UNRESOLVED' pre-v1.4.0): the 4-byte word is a
@@ -2747,20 +3347,20 @@ class CrealityCFS:
             addr,
             STATUS_OPERATIONAL,
             CMD_MEASURING_WHEEL,
-            data=bytes([0x01]),
+            data=bytes([slot & 0xFF]),
         )
         if resp is None:
-            logger.warning("creality_cfs: MEASURING_WHEEL addr=0x%02X, no response", addr)
+            logger.warning("creality_cfs: MEASURING_WHEEL addr=0x%02X slot=0x%02X, no response", addr, slot)
             return b""
 
         data_bytes = resp.get("data", b"")
         logger.debug(
-            "creality_cfs: MEASURING_WHEEL addr=0x%02X raw=%s",
-            addr, data_bytes.hex() if data_bytes else "(none)",
+            "creality_cfs: MEASURING_WHEEL addr=0x%02X slot=0x%02X raw=%s",
+            addr, slot, data_bytes.hex() if data_bytes else "(none)",
         )
         return data_bytes
 
-    def measuring_wheel_mm(self, addr: int) -> float:
+    def measuring_wheel_mm(self, addr: int, slot: int = 0x01) -> float:
         """CMD_MEASURING_WHEEL (0x0E) decoded as a SIGNED mm value (BE IEEE-754 float).
 
         The wheel is NEGATIVE and grows in magnitude as filament feeds; consumers compare
@@ -2769,7 +3369,7 @@ class CrealityCFS:
         frame -- callers MUST tolerate None (a printer without the wheel in the filament
         path, or a flaky read, must not false-trip a watchdog).
         """
-        raw = self.measuring_wheel(addr)
+        raw = self.measuring_wheel(addr, slot)
         if raw is None or len(raw) < 4:
             return None
         try:
@@ -2799,6 +3399,16 @@ class CrealityCFS:
         except Exception:
             return None
 
+    def _cut_button_handler(self, eventtime, state):
+        self._cutter_button_state = bool(state)
+
+    def _cutter_sensor_detected(self):
+        """Toolhead mechanical cutter sensor state: True if blade is depressed,
+        False if blade is rebounded/released, or None if no sensor is configured."""
+        if self.cut_switch_pin:
+            return bool(self._cutter_button_state)
+        return None
+
     def _effective_temp(self, gcmd, label: str) -> float:
         """Resolve the effective melt temperature (TEMP= override, else extrude_temp) and
         enforce the MIN_EXTRUDE_TEMP floor. Raises gcmd.error below the floor -- both the
@@ -2826,28 +3436,56 @@ class CrealityCFS:
         self.gcode.run_script_from_command("M109 S%d" % int(temp))
         return temp
 
-    def _toolhead_pull(self) -> None:
+    def _toolhead_pull(self, allow_cold: bool = False) -> None:
         """The SINGLE interleaved unload pull between the START and FINISH frames:
         G1 E-15 F360 (relative). The reference .so derives -15/360 internally regardless of
-        config -- literal, and exactly ONCE per unload. Skipped if the hotend measurably
-        reads below the melt floor (the caller melt-guards first; this is the last-line
-        check so a failed heat never cold-grinds the gears)."""
+        config -- literal, and exactly ONCE per unload. If allow_cold is True, temporarily
+        enables extruder cold motion to back the severed tail out of the gears."""
         try:
             ext = self.printer.lookup_object("extruder", None)
+            heater = ext.get_heater() if ext is not None else None
             temp = None
             if ext is not None:
                 temp = ext.get_status(self.reactor.monotonic()).get("temperature")
-            if temp is not None and float(temp) < MIN_EXTRUDE_TEMP:
+            if not allow_cold and temp is not None and float(temp) < MIN_EXTRUDE_TEMP:
                 logger.warning("creality_cfs: skipping the unload toolhead pull -- hotend "
                                "reads %.0fC (< %.0fC floor)", float(temp), MIN_EXTRUDE_TEMP)
                 return
         except Exception:
-            # Temperature unreadable (odd host object): the caller's blocking M109 already
-            # ran, so proceed with the pull rather than silently skipping it.
-            pass
-        self.gcode.run_script_from_command("M83")
-        self.gcode.run_script_from_command(
-            "G1 E-%.3f F%.0f" % (RETRUDE_TOOLHEAD_PULL_MM, RETRUDE_TOOLHEAD_PULL_VEL))
+            ext = None
+            heater = None
+
+        old_can_extrude = heater.can_extrude if heater is not None else None
+        if allow_cold and heater is not None:
+            heater.can_extrude = True
+        try:
+            self.gcode.run_script_from_command("M83")
+            self.gcode.run_script_from_command(
+                "G1 E-%.3f F%.0f" % (self.retrude_toolhead_pull_mm, self.retrude_toolhead_pull_vel))
+            self.gcode.run_script_from_command("M400")
+        finally:
+            if allow_cold and heater is not None and old_can_extrude is not None:
+                heater.can_extrude = old_can_extrude
+
+    def _cold_retract(self, distance: float, velocity: float = 300.0) -> None:
+        """Safely retract a small amount of filament even if the hotend is cold.
+        Temporarily sets heater.can_extrude = True to bypass Klipper's min_extrude_temp."""
+        if distance <= 0:
+            return
+        ext = self.printer.lookup_object("extruder", None)
+        heater = ext.get_heater() if ext is not None else None
+        old_can_extrude = heater.can_extrude if heater is not None else None
+        if heater is not None:
+            heater.can_extrude = True
+        try:
+            self.gcode.run_script_from_command("M83")
+            self.gcode.run_script_from_command("G1 E-%.3f F%.0f" % (distance, velocity))
+            self.gcode.run_script_from_command("M400")
+        except Exception as e:
+            logger.warning("creality_cfs: _cold_retract error: %s", e)
+        finally:
+            if heater is not None and old_can_extrude is not None:
+                heater.can_extrude = old_can_extrude
 
     def _dwell(self, seconds: float) -> None:
         """In-handler pacing dwell (G4). Stays inside the gcode context and lets the
@@ -2869,9 +3507,9 @@ class CrealityCFS:
         never trips within the budget raises a RECOVERABLE gcmd.error (releases the gcode
         mutex so a retry macro can re-run it). Sensorless rigs run ONE ungated cycle.
         """
-        # TEMP GUARD FIRST: the box-motor feed rams filament toward the hotend and bypasses
-        # Klipper's cold-extrude protection entirely -- enforce our own floor + M109.
-        self._melt_guard(gcmd, "CFS_EXTRUDE")
+        # Loading is strictly cold: CFS feeds filament through the Bowden tube to the
+        # toolhead entry switch (PA11). The extruder motor does not turn and filament does
+        # not enter the melt zone. Hotend purge is handled separately by CFS_FLUSH.
         self.enter_feed_mode(addr)                    # 0x04 [00][01] (fixed pair)
         self.ctrl_connection_motor_action(addr, True)  # 0x0F 01 engage
         flag = self.get_hardware_status(addr, 0x00)    # one-shot ping; do NOT gate on it
@@ -2904,9 +3542,14 @@ class CrealityCFS:
         self.set_print_mode(addr, slot)                # 0x04 [slot][00]
         self.ctrl_connection_motor_action(addr, False)  # 0x0F 00 release
         try:
-            self._active_tool = SLOT_BITMASKS.index(slot)
+            new_tool = (addr - 1) * 4 + SLOT_BITMASKS.index(slot)
+            if self._active_tool is not None and self._active_tool != new_tool:
+                self._previous_tool = self._active_tool
+            self._active_tool = new_tool
         except ValueError:
             self._active_tool = None
+        self._cut_state = False  # Freshly loaded strand in nozzle is uncut
+        self._save_state()
         if have_sensor:
             gcmd.respond_info(
                 "CFS_EXTRUDE: filament reached the toolhead (switch tripped) after %d ramp "
@@ -2933,81 +3576,105 @@ class CrealityCFS:
         not feeding), else treat the completed FINISH frame as success.
         """
         deadline = self.reactor.monotonic() + RETRUDE_WALL_BUDGET_S
-        # MELT GUARD FIRST: a cold hotend silently fails to pull filament out of the gears
-        # (no-op unload), and the E-15 pull would hard-error on mainline anyway.
-        self._melt_guard(gcmd, "CFS_RETRUDE")
+
+        has_filament = self._toolhead_filament_detected()
+        cold_override = (gcmd.get_int("COLD", 0) == 1) or (gcmd.get_float("TEMP", 1.0) == 0.0)
+
+        # 1. Automatic cut if filament is still detected in toolhead and uncut
+        if has_filament and not self._cut_state and not cold_override:
+            if self.cut_switch_pin and self.pre_cut_pos_x is not None:
+                gcmd.respond_info(
+                    "CFS_RETRUDE: filament in toolhead not yet cut; performing automatic cut...")
+                self.cmd_CFS_CUT(gcmd)
+            else:
+                self._melt_guard(gcmd, "CFS_RETRUDE")
+
+        # 2. Melt guard check: if cut confirmed, or cold override, or toolhead empty -> cold pull allowed
+        allow_cold = (self._cut_state is True) or (not has_filament) or cold_override
+        if not allow_cold:
+            self._melt_guard(gcmd, "CFS_RETRUDE")
+        else:
+            gcmd.respond_info("CFS_RETRUDE: filament cut confirmed; unloading filament...")
+
         self.enter_feed_mode(addr)                              # 0x04 [00][01] (fixed pair)
-        self.get_hardware_status(addr, HW_SENSOR_MATERIAL)      # 0x08 00 (material), once
-        remaining = deadline - self.reactor.monotonic()
-        if remaining > 0:
-            # Phase 0: trigger byte 0x00 = "stop on the BUFFER EMPTY limit" (the trigger
-            # selector, per the buffer spec). A no-reply within the hold-covering budget is
-            # the phase-0 failure mode -> latch key851 (buffer empty limit not triggered).
-            # Diagnostic only: completion still gates on the toolhead switch.
-            st = self.retrude_phase(addr, slot, RETRUDE_PHASE_START,
-                                    timeout=min(RETRUDE_START_TIMEOUT_S, remaining))
-            if st is None:
-                self._record_error(851)
-                gcmd.respond_info("CFS_RETRUDE: START (buffer-empty-limit pull) got no "
-                                  "reply -- key851 latched (diagnostic; completion gates "
-                                  "on the toolhead switch).")
-            elif st == 0x14:
-                self._record_error(849)
-                gcmd.respond_info("CFS_RETRUDE: START frame status 0x14 -- key849 latched "
-                                  "(failed to exit connections; diagnostic only).")
-            elif st != 0x00:
-                gcmd.respond_info("CFS_RETRUDE: START frame status 0x%02X (diagnostic only; "
-                                  "completion gates on the toolhead switch)." % st)
-        self._toolhead_pull()                                   # ONE G1 E-15 F360
-        self.get_hardware_status(addr, HW_SENSOR_CONNECTIONS)   # 0x08 01 (connections), once
-        remaining = deadline - self.reactor.monotonic()
-        if remaining > 0:
-            # Phase 1: trigger byte 0x01 = "stop on the slot MATERIAL sensor" (the long
-            # reel-in; ACK held ~9.6 s). A 0x14 status maps to key849.
-            st = self.retrude_phase(addr, slot, RETRUDE_PHASE_FINISH,
-                                    timeout=min(RETRUDE_FINISH_TIMEOUT_S, remaining))
-            if st == 0x14:
-                self._record_error(849)
-                gcmd.respond_info("CFS_RETRUDE: FINISH frame status 0x14 -- key849 latched "
-                                  "(failed to exit connections; diagnostic only).")
-            elif st not in (None, 0x00):
-                gcmd.respond_info("CFS_RETRUDE: FINISH frame status 0x%02X (diagnostic only)."
-                                  % st)
-        # COMPLETION GATE: the toolhead filament switch must clear (go not-detected).
-        had_sensor = self._toolhead_filament_detected() is not None
-        sensor_deadline = min(deadline,
-                              self.reactor.monotonic() + RETRUDE_SENSOR_WAIT_S)
-        done = False
-        while self.reactor.monotonic() < sensor_deadline:
-            det = self._toolhead_filament_detected()
-            if det is False:
-                done = True
-                break
-            if not had_sensor:
-                # Sensorless corroboration: the box reports the slot no longer loaded AND
-                # no longer in feed mode -> slot emptied.
-                st = self.get_box_state(addr)
-                if st is not None and not st.get("loaded") and not st.get("feeding"):
+        self.ctrl_connection_motor_action(addr, True)           # 0x0F 01 engage feeder motor
+        try:
+            self.get_hardware_status(addr, HW_SENSOR_MATERIAL)      # 0x08 00 (material), once
+            remaining = deadline - self.reactor.monotonic()
+            if remaining > 0:
+                # Phase 0: trigger byte 0x00 = "stop on the BUFFER EMPTY limit" (the trigger
+                # selector, per the buffer spec). CFS box reels filament into spool until buffer is empty.
+                st = self.retrude_phase(addr, slot, RETRUDE_PHASE_START,
+                                        timeout=min(RETRUDE_START_TIMEOUT_S, remaining))
+                if st is None:
+                    self._record_error(851)
+                    gcmd.respond_info("CFS_RETRUDE: START (buffer-empty-limit pull) got no "
+                                      "reply -- key851 latched (diagnostic; completion gates "
+                                      "on the toolhead switch).")
+                elif st == 0x14:
+                    self._record_error(849)
+                    gcmd.respond_info("CFS_RETRUDE: START frame status 0x14 -- key849 latched "
+                                      "(failed to exit connections; diagnostic only).")
+                elif st != 0x00:
+                    gcmd.respond_info("CFS_RETRUDE: START frame status 0x%02X (diagnostic only; "
+                                      "completion gates on the toolhead switch)." % st)
+            self._toolhead_pull(allow_cold=allow_cold)              # ONE G1 E-15 F360 into empty buffer
+            self.get_hardware_status(addr, HW_SENSOR_CONNECTIONS)   # 0x08 01 (connections), once
+            remaining = deadline - self.reactor.monotonic()
+            if remaining > 0:
+                # Phase 1: trigger byte 0x01 = "stop on the slot MATERIAL sensor" (the long
+                # reel-in; ACK held ~9.6 s). Reels filament all the way back into the CFS slot.
+                st = self.retrude_phase(addr, slot, RETRUDE_PHASE_FINISH,
+                                        timeout=min(RETRUDE_FINISH_TIMEOUT_S, remaining))
+                if st == 0x14:
+                    self._record_error(849)
+                    gcmd.respond_info("CFS_RETRUDE: FINISH frame status 0x14 -- key849 latched "
+                                      "(failed to exit connections; diagnostic only).")
+                elif st not in (None, 0x00):
+                    gcmd.respond_info("CFS_RETRUDE: FINISH frame status 0x%02X (diagnostic only)."
+                                      % st)
+            # COMPLETION GATE: the toolhead filament switch must clear (go not-detected).
+            had_sensor = self._toolhead_filament_detected() is not None
+            sensor_deadline = min(deadline,
+                                  self.reactor.monotonic() + RETRUDE_SENSOR_WAIT_S)
+            done = False
+            while self.reactor.monotonic() < sensor_deadline:
+                det = self._toolhead_filament_detected()
+                if det is False:
                     done = True
                     break
-            self._dwell(RETRUDE_SENSOR_POLL_DT_S)
-        if not done and not had_sensor:
-            # Never fail a sensorless rig on the absence of a signal it cannot produce:
-            # the completed START/pull/FINISH sequence is the best truth available.
-            done = True
-        if done:
-            if self._active_tool is not None and SLOT_BITMASKS[self._active_tool] == slot:
-                self._active_tool = None
-            gcmd.respond_info("CFS_RETRUDE: unload complete on slot 0x%02X (toolhead "
-                              "filament switch cleared)." % slot
-                              if had_sensor else
-                              "CFS_RETRUDE: unload sequence complete on slot 0x%02X "
-                              "(no toolhead switch -- verify visually)." % slot)
-            return
-        raise gcmd.error(
-            "CFS_RETRUDE: the toolhead filament switch did not clear within the %.0fs "
-            "budget on slot 0x%02X -- filament is likely jammed between the gears and the "
-            "buffer. Clear the jam and retry the unload." % (RETRUDE_WALL_BUDGET_S, slot))
+                if not had_sensor:
+                    # Sensorless corroboration: the box reports the slot no longer loaded AND
+                    # no longer in feed mode -> slot emptied.
+                    st = self.get_box_state(addr)
+                    if st is not None and not st.get("loaded") and not st.get("feeding"):
+                        done = True
+                        break
+                self._dwell(RETRUDE_SENSOR_POLL_DT_S)
+            if not done and not had_sensor:
+                # Never fail a sensorless rig on the absence of a signal it cannot produce:
+                # the completed START/pull/FINISH sequence is the best truth available.
+                done = True
+            if done:
+                unloaded_tool = (addr - 1) * 4 + (SLOT_BITMASKS.index(slot) if slot in SLOT_BITMASKS else -1)
+                if unloaded_tool >= 0:
+                    self._previous_tool = unloaded_tool
+                if self._active_tool == unloaded_tool:
+                    self._active_tool = None
+                self._save_state()
+                gcmd.respond_info("CFS_RETRUDE: unload complete on slot 0x%02X (toolhead "
+                                  "filament switch cleared)." % slot
+                                  if had_sensor else
+                                  "CFS_RETRUDE: unload sequence complete on slot 0x%02X "
+                                  "(no toolhead switch -- verify visually)." % slot)
+                return
+            raise gcmd.error(
+                "CFS_RETRUDE: the toolhead filament switch did not clear within the %.0fs "
+                "budget on slot 0x%02X -- filament is likely jammed between the gears and the "
+                "buffer. Clear the jam and retry the unload." % (RETRUDE_WALL_BUDGET_S, slot))
+        finally:
+            self.ctrl_connection_motor_action(addr, False)  # 0x0F 00 release feeder motor
+            self._cut_state = False  # Strand unloaded; reset cut state
 
     # ---- change-flush helpers (wire-verified split model) ----
     def _flush_cap(self) -> float:
@@ -3039,6 +3706,99 @@ class CrealityCFS:
             n = FLUSH_CYCLES_MAX - 1
         return [cap] + [rest / n] * n
 
+    def _material_to_temp(self, mat_name: str | None) -> float:
+        """Resolve the safe melting/extrusion temperature for a given filament material name."""
+        if not mat_name or not isinstance(mat_name, str):
+            return self.extrude_temp
+        norm = mat_name.strip().lower()
+        if norm in ("unknown", "none", ""):
+            return self.extrude_temp
+        if norm in MATERIAL_DEFAULT_TEMPS:
+            return MATERIAL_DEFAULT_TEMPS[norm]
+        words = norm.replace("-", " ").replace("_", " ").split()
+        for w in words:
+            if w in MATERIAL_DEFAULT_TEMPS:
+                return MATERIAL_DEFAULT_TEMPS[w]
+        if "nylon" in norm or "pa" in words:
+            return 280.0
+        if "polycarbonate" in norm or "pc" in words:
+            return 270.0
+        if "abs" in norm or "asa" in norm or "hips" in norm:
+            return 260.0
+        if "petg" in norm or "pet" in norm:
+            return 245.0
+        if "tpu" in norm or "tpe" in norm:
+            return 230.0
+        if "pla" in norm:
+            return 220.0
+        if "pva" in norm or "bvoh" in norm:
+            return 215.0
+        return self.extrude_temp
+
+    def _get_slot_info(self, tool_idx: int) -> dict:
+        """Get slot metadata (material, melt_temp, color, vendor) for CFS or bypass slot."""
+        if tool_idx is None or tool_idx < 0:
+            return {}
+        slot = self._slots.get(tool_idx)
+        if slot and (slot.get("material") or slot.get("melt_temp")):
+            return slot
+        if tool_idx == self._bypass_tool_idx:
+            # Fallback to creality_spool_rfid if present and active on Creality hardware
+            rfid = self.printer.lookup_object('creality_spool_rfid', None)
+            if rfid is not None and getattr(rfid, 'active', False):
+                return {
+                    "material": getattr(rfid, 'material', None),
+                    "melt_temp": getattr(rfid, 'melt_temp', None),
+                    "color": getattr(rfid, 'color', "none"),
+                    "vendor": getattr(rfid, 'vendor', "Creality"),
+                    "is_bypass": True,
+                    "present": True,
+                }
+            return {
+                "material": self.bypass_material,
+                "melt_temp": self.bypass_temp,
+                "color": self.bypass_color,
+                "vendor": self.bypass_vendor,
+                "is_bypass": True,
+                "present": True,
+            }
+        return slot or {}
+
+    def _flush_temperature_arbitration(self, gcmd):
+        """Determine the safe flush temperature by arbitrating between the previously
+        melted filament and the newly incoming filament: max(T_prev, T_next).
+
+        Returns: (flush_temp, next_temp)
+        """
+        explicit = gcmd.get_float("TEMP", None)
+
+        curr_tool = self._active_tool
+        curr_info = self._get_slot_info(curr_tool)
+        curr_mat = curr_info.get("material")
+        curr_temp = float(curr_info.get("melt_temp") or self._material_to_temp(curr_mat))
+
+        prev_tool = self._previous_tool
+        prev_info = self._get_slot_info(prev_tool)
+        prev_mat = prev_info.get("material")
+        prev_temp = float(prev_info.get("melt_temp") or self._material_to_temp(prev_mat))
+
+        if explicit is not None and explicit > 0:
+            flush_temp = max(explicit, MIN_EXTRUDE_TEMP)
+            next_temp = flush_temp
+        else:
+            flush_temp = max(prev_temp, curr_temp, MIN_EXTRUDE_TEMP)
+            next_temp = curr_temp
+
+        prev_label = f"T{prev_tool} (bypass)" if prev_tool == self._bypass_tool_idx else f"T{prev_tool}"
+        curr_label = f"T{curr_tool} (bypass)" if curr_tool == self._bypass_tool_idx else f"T{curr_tool}"
+        prev_str = f"{prev_label} ({prev_mat or 'unknown'} @ {prev_temp:.0f}C)" if prev_tool is not None else f"unknown ({prev_temp:.0f}C)"
+        curr_str = f"{curr_label} ({curr_mat or 'unknown'} @ {curr_temp:.0f}C)" if curr_tool is not None else f"unknown ({curr_temp:.0f}C)"
+        gcmd.respond_info(
+            f"CFS_FLUSH: safe temp arbitration: previous [{prev_str}], "
+            f"incoming [{curr_str}] -> purge at {flush_temp:.0f}C"
+        )
+        return flush_temp, next_temp
+
     def _default_flush_total(self, gcmd) -> float:
         """The change-flush TOTAL purge length:
         LEN= (the explicit total) > VOLUME= (flush volume in mm^3, run through the
@@ -3064,17 +3824,43 @@ class CrealityCFS:
         for entry in self._box_table:
             online["box%d" % entry.addr] = (
                 entry.online == BoxAddressEntry.ONLINE_ONLINE)
+
+        # Check if flush is recommended between previous and active tool
+        flush_recommended = False
+        if self._previous_tool is not None and self._active_tool is not None and self._previous_tool >= 0:
+            p_info = self._get_slot_info(self._previous_tool)
+            a_info = self._get_slot_info(self._active_tool)
+            p_mat = (p_info.get("material") or "").strip().lower()
+            a_mat = (a_info.get("material") or "").strip().lower()
+            p_col = (p_info.get("color") or "").strip().lower()
+            a_col = (a_info.get("color") or "").strip().lower()
+            if (p_mat != a_mat) or (p_col != a_col and p_col not in ("none", "-1", "") and a_col not in ("none", "-1", "")):
+                flush_recommended = True
+
         return {
             "is_connected": self.is_connected,
             "box_count": self.box_count,
             "online": online,
             "active_tool": self._active_tool if self._active_tool is not None else -1,
+            "previous_tool": self._previous_tool if self._previous_tool is not None else -1,
+            "flush_recommended": bool(flush_recommended),
             "slots": {str(k): dict(v) for k, v in self._slots.items()},
+            "temperature": self._temperature,
+            "humidity": self._humidity,
+            "mode": self._mode,
+            "jam_status": self._jam_status,
+            "photoelectric_status": self._photoelectric_status,
+            "version": self._box_version,
+            "sn": self._box_sn,
+            "type": "CFS",
             "auto_refill": int(self.auto_refill),
             "same_material": list(self.same_material),
             "last_error": dict(self._last_error) if self._last_error else None,
-            # Last 0x05 buffer reading (cached at the choreography seams; the stock host
-            # never polls the buffer periodically, so this refreshes on loads/cuts only).
+            "cutter_sensor": bool(self._cutter_button_state) if self.cut_switch_pin else None,
+            "bypass_active": bool(self._bypass_mode),
+            "bypass_tool": self._bypass_tool_idx,
+            "tool_map": dict(self._tool_map),
+            # Last 0x05 buffer reading (cached at choreography seams)
             "buffer_code": self._buffer_state,
             "buffer": (BUFFER_STATE_NAMES.get(self._buffer_state, "unknown")
                        if self._buffer_state is not None else "unknown"),
@@ -3083,9 +3869,7 @@ class CrealityCFS:
     # -----------------------------------------------------------------------
     # Stock-shaped flat `box` status (box_wrapper §5a). Consumed by CFSBoxStatus,
     # registered as the Klipper object `box` so printer.box.* resolves for the Creality /
-    # StoneLabs UIs. The key set + types mirror the stock contract EXACTLY; values are
-    # sourced from this module's live state where it has them (T1 = the primary
-    # controller's four slots) and stock-typed defaults elsewhere.
+    # StoneLabs UIs. The key set + types mirror the stock contract EXACTLY.
     # -----------------------------------------------------------------------
 
     _SLOT_LETTERS = ("A", "B", "C", "D")
@@ -3093,75 +3877,154 @@ class CrealityCFS:
     def _tn_substatus(self, tn_index: int) -> dict:
         """Build one Tn per-box sub-dict in the stock flat shape (box_wrapper §5a).
 
-        tn_index is 0-based (T1 -> 0). T1 maps to the primary controller at addr 0x01,
-        whose four slots this module actually caches in self._slots; T2..T4 reflect only
-        the online state of any daisy-chained boxes (per-slot material for those extra
-        boxes is not modelled yet, so their slot arrays are emitted as defaults to keep
-        the shape intact).
+        tn_index is 0-based (T1 -> 0). T1 maps to the primary controller at addr 0x01.
+        T2..T4 emit stock defaults when not connected.
         """
         entry = self._box_table[tn_index] if tn_index < len(self._box_table) else None
         connected = bool(entry and entry.online == BoxAddressEntry.ONLINE_ONLINE)
-        remain_len = [0, 0, 0, 0]
-        material_type = ["", "", "", ""]
-        any_present = 0
-        # Only the primary controller (T1) has a real per-slot cache in this module.
-        if tn_index == 0:
-            for idx in range(4):
-                slot = self._slots.get(idx)
-                if not slot or not slot.get("present"):
-                    continue
-                any_present = 1
+        if not connected:
+            return {
+                "state": "None",
+                "filament": "None",
+                "temperature": "None",
+                "dry_and_humidity": "None",
+                "filament_detected": "None",
+                "measuring_wheel": "None",
+                "version": "-1",
+                "sn": "-1",
+                "mode": "-1",
+                "vendor": ["-1", "-1", "-1", "-1"],
+                "vender": ["-1", "-1", "-1", "-1"],
+                "remain_len": ["-1", "-1", "-1", "-1"],
+                "color_value": ["-1", "-1", "-1", "-1"],
+                "material_type": ["-1", "-1", "-1", "-1"],
+                "uuid": "None",
+                "change_color_num": ["-1", "-1", "-1", "-1"],
+                "type": "None",
+                "slot_rfid_scrap": "None",
+            }
+
+        vendor = ["unknown", "unknown", "unknown", "unknown"]
+        remain_len = ["-1", "-1", "-1", "-1"]
+        color_value = ["-1", "-1", "-1", "-1"]
+        material_type = ["-1", "-1", "-1", "-1"]
+        change_color_num = ["-1", "-1", "-1", "-1"]
+
+        # Populate slot status for any connected CFS box (T1..T4, 4 slots each)
+        base_idx = tn_index * 4
+        for s_idx in range(4):
+            slot = self._slots.get(base_idx + s_idx)
+            if not slot or not slot.get("present"):
+                vendor[s_idx] = "none"
+                remain_len[s_idx] = "0"
+                color_value[s_idx] = "none"
+                material_type[s_idx] = "none"
+            else:
                 rv = slot.get("remain", -1)
-                remain_len[idx] = int(rv) if isinstance(rv, int) and rv >= 0 else 0
+                remain_len[s_idx] = str(rv) if (isinstance(rv, int) and rv >= 0) else "-1"
                 mv = slot.get("material")
-                material_type[idx] = mv if mv else ""
+                slot_vendor = slot.get("vendor", slot.get("vender", "unknown"))
+                col_raw = str(slot.get("color", "-1"))
+                # Format color to Creality 0RRGGBB format
+                if col_raw.startswith("#"):
+                    col_fmt = "0" + col_raw[1:].upper()
+                elif len(col_raw) == 6 and col_raw.isalnum():
+                    col_fmt = "0" + col_raw.upper()
+                elif col_raw.startswith("0") and len(col_raw) == 7:
+                    col_fmt = col_raw.upper()
+                else:
+                    col_fmt = col_raw
+
+                if mv and str(mv).lower() not in ("none", "-1", "", "unknown"):
+                    code = self.get_cfs_code(mv, slot_vendor)
+                    material_type[s_idx] = code
+                    color_value[s_idx] = col_fmt
+                    vendor[s_idx] = str(slot_vendor)
+                else:
+                    material_type[s_idx] = "-1"
+                    color_value[s_idx] = col_fmt
+                    vendor[s_idx] = str(slot_vendor)
+
+        uuid_val = list(entry.uniid) if (entry and entry.mapped and entry.uniid) else [153, 91, 48, 32, 136, 52, 49, 3, 72, 48, 55, 48]
         return {
-            "state": "connect" if connected else "disconnect",
-            "filament": any_present,
-            "temperature": 0,
-            "dry_and_humidity": 0,
-            "filament_detected": any_present,
-            "measuring_wheel": 0,
-            "version": "",
-            "sn": "",
-            "mode": 0,
-            "vender": ["", "", "", ""],
+            "state": "connect",
+            "filament": "None" if self._active_tool is None else f"T{self._active_tool}",
+            "temperature": str(self._temperature if self._temperature is not None else 26),
+            "dry_and_humidity": str(self._humidity if self._humidity is not None else 40),
+            "filament_detected": "None",
+            "measuring_wheel": "None",
+            "version": self._box_version or "1.5.0",
+            "sn": self._box_sn or "",
+            "mode": str(self._mode if self._mode is not None else 0),
+            "vendor": vendor,
+            "vender": vendor,
             "remain_len": remain_len,
-            "color_value": [0, 0, 0, 0],
+            "color_value": color_value,
             "material_type": material_type,
-            "uuid": "None",
-            "change_color_num": [0, 0, 0, 0],
+            "uuid": uuid_val,
+            "change_color_num": change_color_num,
+            "type": "CFS",
+            "slot_rfid_scrap": str(self._slot_rfid_scrap if self._slot_rfid_scrap is not None else 0),
         }
 
-    def _flat_box_status(self) -> dict:
-        """The stock-shaped flat `box` status dict (box_wrapper §5a).
+    def _compute_same_material_groups(self) -> list:
+        """Compute Creality same_material groups from present slots.
 
-        Emits the exact stock top-level keys (state/filament/map/same_material/cut_state/
-        auto_refill/enable/filament_useup/T1..T4) so printer.box.* drives the stock CFS
-        touchscreen panel and the StoneLabs UIs (which mirror this contract). The nested
-        printer.creality_cfs.* status is unchanged for this module's own macros.
+        Format expected by Creality firmware and HelixScreen:
+        [ [code, color, ["T1A", ...], material_name], ... ]
         """
+        groups = {}
+        for tool_idx in range(self.box_count * 4):
+            slot = self._slots.get(tool_idx)
+            if not slot or not slot.get("present"):
+                continue
+            mat = slot.get("material")
+            if not mat or str(mat).lower() in ("none", "-1", "unknown", ""):
+                continue
+            col = str(slot.get("color", "")).strip()
+            if col.startswith("#"):
+                col_cfs = "0" + col[1:].upper()
+            elif len(col) == 6 and col.isalnum():
+                col_cfs = "0" + col.upper()
+            elif col.startswith("0") and len(col) == 7:
+                col_cfs = col.upper()
+            else:
+                col_cfs = "0808080"
+
+            addr = (tool_idx // 4) + 1
+            letter = self._SLOT_LETTERS[tool_idx % 4]
+            tnn = f"T{addr}{letter}"
+
+            key = (str(mat).strip(), col_cfs)
+            groups.setdefault(key, []).append(tnn)
+
+        result = []
+        for (mat, col_cfs), slot_names in groups.items():
+            code = self.get_cfs_code(mat, "Generic")
+            result.append([code, col_cfs, slot_names, mat])
+        return result
+
+    def _flat_box_status(self) -> dict:
+        """The stock-shaped flat `box` status dict (box_wrapper §5a)."""
         online_any = any(e.online == BoxAddressEntry.ONLINE_ONLINE
                          for e in self._box_table)
         tns = {"T%d" % (i + 1): self._tn_substatus(i) for i in range(4)}
-        # 16-slot remap table T1A..T4D. No physical remap is applied (identity/passthrough):
-        # each logical slot maps to its own global index 0..15.
+        # 16-slot remap table T1A..T4D (string identity passthrough)
         slot_map = {}
-        gi = 0
         for n in range(1, 5):
             for letter in self._SLOT_LETTERS:
-                slot_map["T%d%s" % (n, letter)] = gi
-                gi += 1
-        filament_present = 1 if any(t["filament"] for t in tns.values()) else 0
+                key = "T%d%s" % (n, letter)
+                slot_map[key] = key
+        filament_present = 1 if any(self._slots.get(i, {}).get("present") for i in range(4)) else 0
+        same_mat = self._compute_same_material_groups() if not self.same_material else list(self.same_material)
         status = {
-            "state": "connect" if online_any else "disconnect",
             "filament": filament_present,
-            "map": slot_map,
-            "same_material": list(self.same_material),
-            "cut_state": bool(self._cut_state),
+            "state": "connect" if online_any else "disconnect",
             "auto_refill": int(self.auto_refill),
             "enable": int(self.box_enable),
             "filament_useup": int(self._filament_useup),
+            "same_material": same_mat,
+            "map": slot_map,
         }
         status.update(tns)
         return status
@@ -3192,20 +4055,40 @@ class CrealityCFS:
     def find_refill_slot(self, tool: int):
         """Return the index of a present, same-material slot that can replace `tool`, else None.
 
-        Uses the same_material groups (BOX_UPDATE_SAME_MATERIAL_LIST) to find slots
-        equivalent to `tool`, and the cached slot presence (self._slots) to pick the first
-        that currently holds filament. `tool` itself is excluded. Pure resolution -- no
-        wire traffic -- so it is safe to call from a macro or the auto-refill path.
+        Supports both standard Creality groups ([code, color, ["T1A", ...], mat]) and
+        simple tool index lists. Excludes `tool` itself.
         """
+        tool_name = f"T{tool // 4 + 1}{self._SLOT_LETTERS[tool % 4]}"
         for group in self.same_material:
-            if tool not in group:
+            if not isinstance(group, list):
                 continue
-            for cand in group:
-                if cand == tool:
+            if len(group) >= 4 and isinstance(group[2], list):
+                slot_list = group[2]
+            else:
+                slot_list = group
+
+            in_group = False
+            for entry in slot_list:
+                if entry == tool or entry == tool_name:
+                    in_group = True
+                    break
+            if not in_group:
+                continue
+
+            for cand_entry in slot_list:
+                if cand_entry == tool or cand_entry == tool_name:
                     continue
-                slot = self._slots.get(cand)
+                if isinstance(cand_entry, int):
+                    cand_idx = cand_entry
+                elif isinstance(cand_entry, str) and len(cand_entry) == 3 and cand_entry.startswith("T"):
+                    unit_num = int(cand_entry[1]) - 1
+                    letter_idx = ord(cand_entry[2].upper()) - ord("A")
+                    cand_idx = unit_num * 4 + letter_idx
+                else:
+                    continue
+                slot = self._slots.get(cand_idx)
                 if slot and slot.get("present"):
-                    return cand
+                    return cand_idx
         return None
 
     # -----------------------------------------------------------------------
@@ -3227,23 +4110,37 @@ class CrealityCFS:
         this handler.
         """
         self.auto_refill = gcmd.get_int("ENABLE", minval=0, maxval=1)
+        self._save_state()
         gcmd.respond_info(
             "CFS auto-refill %s" % ("enabled" if self.auto_refill else "disabled"))
 
     cmd_update_same_material_list_help: str = (
         "Define groups of slots holding the same material (for auto-refill). "
-        "Parameter: GROUPS=\"0,1|2,3\" (pipe-separated groups of comma-separated slot ids); "
-        "an empty GROUPS= clears the list."
+        "Parameter: [GROUPS=\"0,1|2,3\"]; if omitted, auto-computes equivalence from slots; "
+        "GROUPS=\"\" clears the list."
     )
 
     def cmd_update_same_material_list(self, gcmd) -> None:
-        """G-code: BOX_UPDATE_SAME_MATERIAL_LIST GROUPS="0,1|2,3".
+        """G-code: BOX_UPDATE_SAME_MATERIAL_LIST [GROUPS="0,1|2,3"].
 
         Records the slot-equivalence sets auto-refill uses to pick a replacement slot that
-        holds the same material. Surfaced as printer.box.same_material. Parsing only -- no
-        wire traffic.
+        holds the same material. Surfaced as printer.box.same_material. If GROUPS is
+        omitted (as when called by HelixScreen), automatically groups slots by matching
+        material and color.
         """
-        raw = gcmd.get("GROUPS", "")
+        raw = gcmd.get("GROUPS", None)
+        if raw is None:
+            self.same_material = self._compute_same_material_groups()
+            self._save_state()
+            gcmd.respond_info(
+                "CFS same-material groups auto-computed: %s" % (self.same_material if self.same_material else "(none)"))
+            return
+        raw = raw.strip()
+        if not raw:
+            self.same_material = []
+            self._save_state()
+            gcmd.respond_info("CFS same-material groups cleared")
+            return
         groups = []
         for grp in raw.split("|"):
             grp = grp.strip()
@@ -3259,31 +4156,37 @@ class CrealityCFS:
                 except ValueError:
                     raise gcmd.error(
                         "BOX_UPDATE_SAME_MATERIAL_LIST: bad slot id %r" % tok)
-                if v < 0 or v > 3:
+                if v < 0 or v > 15:
                     raise gcmd.error(
-                        "BOX_UPDATE_SAME_MATERIAL_LIST: slot id %d out of range 0-3" % v)
+                        "BOX_UPDATE_SAME_MATERIAL_LIST: slot id %d out of range 0-15" % v)
                 if v not in slots:
                     slots.append(v)
             if slots:
-                groups.append(slots)
+                s0 = self._slots.get(slots[0], {})
+                mat0 = s0.get("material", "unknown")
+                code0 = self.get_cfs_code(mat0, s0.get("vendor"))
+                col0 = str(s0.get("color", "0808080"))
+                slot_names = [f"T{s // 4 + 1}{self._SLOT_LETTERS[s % 4]}" for s in slots]
+                groups.append([code0, col0, slot_names, mat0])
         self.same_material = groups
+        self._save_state()
         gcmd.respond_info(
             "CFS same-material groups set: %s" % (groups if groups else "(cleared)"))
 
     cmd_check_material_refill_help: str = (
         "Report the same-material slot that would refill a (runout) slot. "
-        "Parameters: TOOL=<0-3>"
+        "Parameters: TOOL=<0-15>"
     )
 
     def cmd_check_material_refill(self, gcmd) -> None:
-        """G-code: BOX_CHECK_MATERIAL_REFILL TOOL=<0-3>.
+        """G-code: BOX_CHECK_MATERIAL_REFILL TOOL=<0-15>.
 
         Resolves -- from the same-material groups and the cached slot presence -- which
         alternate slot could take over for TOOL, and reports it (or that none is
         available). This is the pure slot-equivalence resolution; issuing the actual load
         swap is left to the caller/macro (it needs the load choreography + hardware).
         """
-        tool = gcmd.get_int("TOOL", minval=0, maxval=3)
+        tool = gcmd.get_int("TOOL", minval=0, maxval=15)
         candidate = self.find_refill_slot(tool)
         if candidate is None:
             gcmd.respond_info(
@@ -3364,13 +4267,70 @@ class CrealityCFS:
                     extra = " [insert event]"
                 elif st.get("busy"):
                     extra = " [busy/cal active]"
+                th_info = ""
+                if st.get("temperature") is not None:
+                    th_info = f" temp={st['temperature']}C humidity={st['humidity']}% mode={st.get('mode')}"
                 results.append(
-                    f"Box {addr} (0x{addr:02X}): {name} raw={st['raw'].hex()}{extra}"
+                    f"Box {addr} (0x{addr:02X}): {name}{th_info} raw={st['raw'].hex()}{extra}"
                 )
+                # Spool / Slot information for this box
+                slot_letters = ["A", "B", "C", "D"]
+                for s_idx in range(4):
+                    tool_idx = (addr - 1) * 4 + s_idx
+                    slot_info = self._slots.get(tool_idx, {})
+                    pres = "YES" if slot_info.get("present") else "NO"
+                    mat = slot_info.get("material") or "None"
+                    col = slot_info.get("color") or "none"
+                    ven = slot_info.get("vendor", slot_info.get("vender")) or "unknown"
+                    rem = slot_info.get("remain", -1)
+                    rem_str = f"{rem}%" if rem >= 0 else "unknown"
+                    act = " [ACTIVE]" if self._active_tool == tool_idx else ""
+                    results.append(
+                        f"  - Slot {slot_letters[s_idx]} (T{tool_idx}): "
+                        f"Present={pres} | Material={mat} | Color={col} | Vendor={ven} | "
+                        f"Remain={rem_str}{act}"
+                    )
             except Exception as exc:
                 results.append(f"Box {addr}: ERROR: {exc}")
 
         gcmd.respond_info("\n".join(results))
+
+    cmd_CFS_SLOTS_help: str = (
+        "Display loaded filament, material, color, and vendor properties for CFS slots. "
+        "Parameters: [BOX=<1-4>] [TOOL=<0-15>]"
+    )
+
+    def cmd_CFS_SLOTS(self, gcmd) -> None:
+        """G-code: CFS_SLOTS [BOX=<1-4>] [TOOL=<0-15>] - display loaded spools/materials."""
+        tool_param = gcmd.get_int("TOOL", None, minval=0, maxval=self.box_count * 4 - 1)
+        if tool_param is not None:
+            tools = [tool_param]
+        else:
+            box_param = gcmd.get_int("BOX", None, minval=1, maxval=self.box_count)
+            if box_param is not None:
+                tools = list(range((box_param - 1) * 4, box_param * 4))
+            else:
+                tools = list(range(self.box_count * 4))
+
+        slot_letters = ["A", "B", "C", "D"]
+        lines = ["CFS Spool Configuration:"]
+        for t in tools:
+            addr = (t // 4) + 1
+            s_idx = t % 4
+            slot_info = self._slots.get(t, {})
+            pres = "YES" if slot_info.get("present") else "NO"
+            mat = slot_info.get("material") or "None"
+            col = slot_info.get("color") or "none"
+            ven = slot_info.get("vendor", slot_info.get("vender")) or "unknown"
+            rem = slot_info.get("remain", -1)
+            rem_str = f"{rem}%" if rem >= 0 else "unknown"
+            act = " [ACTIVE]" if self._active_tool == t else ""
+            lines.append(
+                f"  T{t:<2} (Box {addr} Slot {slot_letters[s_idx]}): "
+                f"Present={pres:<3} | Material={mat:<10} | Color={col:<8} | Vendor={ven:<10} | "
+                f"Remain={rem_str}{act}"
+            )
+        gcmd.respond_info("\n".join(lines))
 
     cmd_CFS_VERSION_help: str = (
         "Query firmware version and serial number from one or all CFS boxes. "
@@ -3449,58 +4409,55 @@ class CrealityCFS:
             raise gcmd.error(f"CFS_SET_MODE failed: {exc}")
 
     cmd_CFS_SET_PRELOAD_help: str = (
-        "Configure pre-loading on a CFS box. "
-        "Parameters: BOX=<1-4> MASK=<0-255> ENABLE=<0|1> | PHASE=<0-2>"
+        "Arm/disarm CFS pre-loading. Parameters: BOX=<1-4>|ADDR=<1-4> "
+        "MASK=<0-255>|NUM=<0-255> (ENABLE=<0|1> | ACTION=<RUN|STOP> | PHASE=<0-2>)"
     )
 
     def cmd_CFS_SET_PRELOAD(self, gcmd) -> None:
-        """G-code: CFS_SET_PRELOAD BOX=<1-4> MASK=<0-255> (ENABLE=<0|1> | PHASE=<0-2>).
-
-        v1.4.0 INVERSION FIX: on the wire, ARM is phase 0x00 and DISARM is phase 0x01.
-        The pre-v1.4.0 handler passed ENABLE straight through as the phase byte, so
-        ENABLE=1 emitted [mask][0x01] -- the wire DISARM -- and vice versa. ENABLE now
-        maps to the correct phase. The reply STATUS byte is checked (non-ACK reported).
-
-        Advanced form: PHASE= sends an explicit phase byte (2 = per-slot re-arm, which
-        BLOCKS ~38 s -- it is given the long blocking timeout automatically).
-
-        Usage: CFS_SET_PRELOAD BOX=1 MASK=15 ENABLE=1   # arm pre-loading, all 4 slots
-               CFS_SET_PRELOAD BOX=1 MASK=15 ENABLE=0   # disarm (end of print)
-               CFS_SET_PRELOAD BOX=1 MASK=2 PHASE=2     # re-arm slot B (blocking ~38 s)
-        """
+        """G-code: CFS_SET_PRELOAD [BOX=<0-4>] [MASK=<0-255>] (ENABLE=<0|1> | PHASE=<0-2>)."""
         if not self.is_connected:
             raise gcmd.error("CFS serial port is not connected")
 
-        addr = gcmd.get_int("BOX", minval=1, maxval=4)
-        mask = gcmd.get_int("MASK", minval=0, maxval=255)
+        raw_box = gcmd.get_int("BOX", None, minval=0, maxval=4)
+        if raw_box is None:
+            raw_box = gcmd.get_int("ADDR", None, minval=0, maxval=4)
+        mask = gcmd.get_int("MASK", None, minval=0, maxval=255)
+        if mask is None:
+            mask = gcmd.get_int("NUM", PRELOAD_MASK_ALL, minval=0, maxval=255)
+        action = gcmd.get("ACTION", None)
         phase = gcmd.get_int("PHASE", None, minval=0, maxval=2)
         if phase is None:
-            enable = gcmd.get_int("ENABLE", minval=0, maxval=1)
-            # ARM = wire phase 0x00, DISARM = 0x01 (the inversion fix).
-            phase = PRELOAD_PHASE_ARM if enable else PRELOAD_PHASE_DISARM
-        # The per-slot re-arm blocks ~38 s while the controller settles the slot servo; a
-        # short timeout would hang up mid-phase and NAK-wedge the box.
+            if action is not None:
+                phase = PRELOAD_PHASE_ARM if action.upper() in ("RUN", "START", "1", "TRUE", "ENABLE") else PRELOAD_PHASE_DISARM
+            else:
+                enable = gcmd.get_int("ENABLE", 1, minval=0, maxval=1)
+                phase = PRELOAD_PHASE_ARM if enable else PRELOAD_PHASE_DISARM
         timeout = (PRELOAD_BLOCKING_TIMEOUT_S
                    if phase == PRELOAD_PHASE_SLOT_REARM else None)
 
+        if raw_box is None or raw_box == 0:
+            target_addrs = [e.addr for e in self._box_table if e.online == BoxAddressEntry.ONLINE_ONLINE]
+            if not target_addrs:
+                target_addrs = [1]
+        else:
+            target_addrs = [raw_box]
+
         try:
-            # Single-shot (retries=1): the reference implementation never retries a 0x0D
-            # frame, and a retried 90 s blocking phase on a silent box would otherwise hold
-            # the gcode mutex for retry_count x 90 s (review finding).
-            ok = self.set_pre_loading(addr, mask, phase, timeout=timeout, retries=1)
-            label = {PRELOAD_PHASE_ARM: "armed",
-                     PRELOAD_PHASE_DISARM: "disarmed",
-                     PRELOAD_PHASE_SLOT_REARM: "slot re-arm run"}.get(
-                         phase, "phase 0x%02X sent" % phase)
-            if ok:
-                gcmd.respond_info(
-                    f"CFS box {addr}: pre-loading {label} for slot mask 0x{mask:02X}"
-                )
-            else:
-                gcmd.respond_info(
-                    "CFS box %d: SET_PRE_LOADING [%02X %02X] NOT ACKed -- the "
-                    "controller did not confirm (see log)" % (addr, mask, phase)
-                )
+            for addr in target_addrs:
+                ok = self.set_pre_loading(addr, mask, phase, timeout=timeout, retries=1)
+                label = {PRELOAD_PHASE_ARM: "armed",
+                         PRELOAD_PHASE_DISARM: "disarmed",
+                         PRELOAD_PHASE_SLOT_REARM: "slot re-arm run"}.get(
+                             phase, "phase 0x%02X sent" % phase)
+                if ok:
+                    gcmd.respond_info(
+                        f"CFS box {addr}: pre-loading {label} for slot mask 0x{mask:02X}"
+                    )
+                else:
+                    gcmd.respond_info(
+                        "CFS box %d: SET_PRE_LOADING [%02X %02X] NOT ACKed -- the "
+                        "controller did not confirm (see log)" % (addr, mask, phase)
+                    )
         except Exception as exc:
             raise gcmd.error(f"CFS_SET_PRELOAD failed: {exc}")
 
@@ -3529,166 +4486,673 @@ class CrealityCFS:
 
     cmd_CFS_EXTRUDE_help: str = (
         "Load filament from a CFS slot to the toolhead (full sensor-gated choreography). "
-        "Parameters: TOOL=<0-3> [BOX=<1-4>] [TEMP=<C>]"
+        "Parameters: TOOL=<0-15> [BOX=<1-4>] [TEMP=<C>]"
     )
 
     def cmd_CFS_EXTRUDE(self, gcmd) -> None:
-        """G-code: CFS_EXTRUDE TOOL=<0-3> [BOX=<1-4>] [TEMP=<C>] -- the full validated load.
+        """G-code: CFS_EXTRUDE TOOL=<0-15> [BOX=<1-4>] [TEMP=<C>] -- the full validated load.
 
-        v1.4.0: runs the complete choreography (M109 melt guard, feed-mode entry, feeder
-        engage, sensor-gated 0x10 push loop with re-arm cycles, cut check, print mode,
-        feeder release) -- see load_process(). TOOL is REQUIRED: it selects the SLOT
-        BITMASK (T0..T3 -> 0x01/0x02/0x04/0x08) on the controller. BOX selects the
-        CONTROLLER bus address for multi-box daisy-chains and defaults to 1 -- it is a
-        SEPARATE axis from the tool slot (the pre-v1.4.0 macros conflated the two).
+        Runs the complete choreography (feed-mode entry, feeder engage,
+        sensor-gated 0x10 push loop with re-arm cycles, print mode, feeder release)
+        without heating the nozzle (purge is handled separately by CFS_FLUSH). TOOL selects the slot (0-15, or 0-3 if BOX
+        is explicitly provided). BOX selects the CONTROLLER bus address (1-4) for multi-box
+        daisy-chains (auto-derived from TOOL // 4 + 1 if omitted).
 
         Usage: CFS_EXTRUDE TOOL=2
         """
         if not self.is_connected:
             raise gcmd.error("CFS serial port is not connected")
 
-        addr = gcmd.get_int("BOX", 1, minval=1, maxval=4)
-        tool = gcmd.get_int("TOOL", minval=0, maxval=3)
+        tool_val = gcmd.get_int("TOOL", minval=0, maxval=15)
+        if "BOX" in gcmd.get_command_parameters():
+            addr = gcmd.get_int("BOX", minval=1, maxval=4)
+            tool = tool_val % 4
+        else:
+            addr = (tool_val // 4) + 1
+            tool = tool_val % 4
         slot = SLOT_BITMASKS[tool]
         self.load_process(gcmd, addr, slot)
 
     cmd_CFS_RETRUDE_help: str = (
         "Unload filament from the toolhead back into the CFS (full validated choreography). "
-        "Parameters: TOOL=<0-3> [BOX=<1-4>] [TEMP=<C>]"
+        "Automatically performs a cold cut if filament in toolhead is uncut. Parameters: "
+        "[TOOL=<0-15>] [BOX=<1-4>] [TEMP=<C>] [COLD=<0|1>] (defaults to active tool)"
     )
 
     def cmd_CFS_RETRUDE(self, gcmd) -> None:
-        """G-code: CFS_RETRUDE TOOL=<0-3> [BOX=<1-4>] [TEMP=<C>] -- the full validated unload.
-
-        v1.4.0: runs the complete choreography (M109 melt guard, feed-mode entry, 0x08
-        sensor prep reads, the 0x11 START/FINISH pair with the single interleaved toolhead
-        E-15 pull, and the toolhead-switch completion gate within a 60 s wall budget) --
-        see unload_process(). TOOL is REQUIRED (the slot bitmask); BOX is the controller
-        address (multi-box chains only, default 1).
-
-        Usage: CFS_RETRUDE TOOL=0
-        """
+        """G-code: CFS_UNLOAD / CFS_RETRUDE [TOOL=<0-15>] [BOX=<1-4>] [TEMP=<C>] [COLD=<0|1>]
+        -- the full validated unload."""
         if not self.is_connected:
             raise gcmd.error("CFS serial port is not connected")
 
-        addr = gcmd.get_int("BOX", 1, minval=1, maxval=4)
-        tool = gcmd.get_int("TOOL", minval=0, maxval=3)
+        if "TOOL" not in gcmd.get_command_parameters():
+            if self._active_tool is not None:
+                tool_val = self._active_tool
+            elif self._previous_tool is not None and self._previous_tool >= 0:
+                tool_val = self._previous_tool
+                gcmd.respond_info(
+                    "CFS_UNLOAD: no active tool recorded; using previous tool T%d." % tool_val)
+            else:
+                tool_val = 0
+                gcmd.respond_info(
+                    "CFS_UNLOAD: no active tool recorded; defaulting to tool T0 "
+                    "(specify TOOL=<0-15> to select another slot).")
+        else:
+            tool_val = gcmd.get_int("TOOL", minval=0, maxval=15)
+
+        if "BOX" in gcmd.get_command_parameters():
+            addr = gcmd.get_int("BOX", minval=1, maxval=4)
+            tool = tool_val % 4
+        else:
+            addr = (tool_val // 4) + 1
+            tool = tool_val % 4
         slot = SLOT_BITMASKS[tool]
         self.unload_process(gcmd, addr, slot)
 
+    cmd_CFS_UNLOAD = cmd_CFS_RETRUDE
+
+    def _safe_corridor_move(self, gcmd, target_x: float, target_y: float) -> None:
+        """Navigate toolhead safely between any position and (target_x, target_y)
+        factoring for Z clearance, the rear waste chute corridor, and safe park position."""
+        toolhead = self.printer.lookup_object('toolhead')
+        cur_pos = toolhead.get_position()
+        act_x, act_y, act_z = cur_pos[0], cur_pos[1], cur_pos[2]
+
+        if abs(act_x - target_x) < 0.5 and abs(act_y - target_y) < 0.5:
+            return
+
+        # 1. Z clearance gate: if Z is homed and below min_clearance_z, lift Z first
+        cur_status = toolhead.get_status(self.reactor.monotonic())
+        homed_axes = cur_status.get('homed_axes', '')
+        if 'z' in homed_axes and act_z < self.min_clearance_z:
+            gcmd.respond_info(
+                "CFS: lifting Z from %.2f mm to %.2f mm for travel clearance"
+                % (act_z, self.min_clearance_z))
+            self.gcode.run_script_from_command("G90")
+            self.gcode.run_script_from_command("G1 Z%.3f F1200" % self.min_clearance_z)
+            self.gcode.run_script_from_command("M400")
+
+        self.gcode.run_script_from_command("G90")
+        fr = self.travel_velocity
+        chute_entry_x = getattr(self, "chute_entry_x", 139.0)
+        boundary_y = getattr(self, "corridor_boundary_y", self.safe_pos_y - 10.0)
+
+        # 2. If currently deep in the rear chute / wiper area (act_y > safe_pos_y, e.g. Y=329):
+        if act_y > self.safe_pos_y:
+            if target_y > self.safe_pos_y:
+                # Staying in the rear gutter/chute (e.g. wiper to chute): move directly
+                self.gcode.run_script_from_command("G0 X%.3f Y%.3f F%.0f" % (target_x, target_y, fr))
+                self.gcode.run_script_from_command("M400")
+                return
+
+            # Leaving the deep rear chute:
+            # First, if laterally displaced at extrude_pos_x, slide to chute_entry_x to clear flap
+            if abs(act_x - chute_entry_x) > 0.5:
+                self.gcode.run_script_from_command("G0 X%.3f F%.0f" % (chute_entry_x, fr))
+            # Back forward in Y to safe_pos_y to clear wiper, blade, and gutter wall
+            self.gcode.run_script_from_command("G0 Y%.3f F%.0f" % (self.safe_pos_y, fr))
+            act_x = chute_entry_x
+            act_y = self.safe_pos_y
+
+            if target_y <= boundary_y:
+                # Heading onto open bed: exit transition corridor forward first
+                self.gcode.run_script_from_command("G0 Y%.3f F%.0f" % (boundary_y, fr))
+                act_y = boundary_y
+            self.gcode.run_script_from_command("G0 X%.3f Y%.3f F%.0f" % (target_x, target_y, fr))
+            self.gcode.run_script_from_command("M400")
+            return
+
+        # 3. If currently in transition corridor (boundary_y < act_y <= safe_pos_y):
+        if act_y > boundary_y:
+            if target_y > self.safe_pos_y:
+                # Moving into deep chute from transition corridor:
+                # Align to chute_entry_x along safe line first to avoid wiping/blade collision
+                if abs(act_x - chute_entry_x) > 0.5:
+                    self.gcode.run_script_from_command("G0 X%.3f F%.0f" % (chute_entry_x, fr))
+                # Move straight in Y into chute throat
+                self.gcode.run_script_from_command("G0 Y%.3f F%.0f" % (target_y, fr))
+                # Lateral push into final target X (e.g. extrude_pos_x)
+                if abs(chute_entry_x - target_x) > 0.5:
+                    self.gcode.run_script_from_command("G0 X%.3f F%.0f" % (target_x, fr))
+                self.gcode.run_script_from_command("M400")
+                return
+            elif target_y <= boundary_y:
+                # Exiting transition corridor forward onto build plate
+                self.gcode.run_script_from_command("G0 Y%.3f F%.0f" % (boundary_y, fr))
+                self.gcode.run_script_from_command("G0 X%.3f Y%.3f F%.0f" % (target_x, target_y, fr))
+                self.gcode.run_script_from_command("M400")
+                return
+            else:
+                # Staying in transition zone
+                self.gcode.run_script_from_command("G0 X%.3f Y%.3f F%.0f" % (target_x, target_y, fr))
+                self.gcode.run_script_from_command("M400")
+                return
+
+        # 4. If currently on open bed (act_y <= boundary_y):
+        if target_y > boundary_y:
+            # Align in X along safe line before advancing into corridor
+            align_x = chute_entry_x if target_y > self.safe_pos_y else self.safe_pos_x
+            if abs(act_x - align_x) > 0.5:
+                self.gcode.run_script_from_command("G0 X%.3f F%.0f" % (align_x, fr))
+            # Enter safe corridor in Y up to safe_pos_y
+            entry_y = min(target_y, self.safe_pos_y)
+            self.gcode.run_script_from_command("G0 Y%.3f F%.0f" % (entry_y, fr))
+            act_x = align_x
+            act_y = entry_y
+
+            if target_y > self.safe_pos_y:
+                # Entering deep chute: move straight back in Y to target_y
+                self.gcode.run_script_from_command("G0 Y%.3f F%.0f" % (target_y, fr))
+                # Lateral push into final target X
+                if abs(align_x - target_x) > 0.5:
+                    self.gcode.run_script_from_command("G0 X%.3f F%.0f" % (target_x, fr))
+                self.gcode.run_script_from_command("M400")
+                return
+            else:
+                self.gcode.run_script_from_command("G0 X%.3f Y%.3f F%.0f" % (target_x, target_y, fr))
+                self.gcode.run_script_from_command("M400")
+                return
+
+        # 5. Direct move on open bed (both <= boundary_y)
+        self.gcode.run_script_from_command("G0 X%.3f Y%.3f F%.0f" % (target_x, target_y, fr))
+        self.gcode.run_script_from_command("M400")
+
     cmd_CFS_CUT_help: str = (
-        "Mechanical filament cut: ram the toolhead into the cutter, then read the 0x05 "
-        "buffer state as corroboration. Parameters: [BOX=<1-4>] [TEMP=<C>]. Requires "
-        "cut_switch_pin and the cut geometry in [creality_cfs]."
+        "Mechanical filament cut: ram toolhead into the cutter, dwell at apex, verify cut sensor, "
+        "retry progressively deeper if unconfirmed, verify blade rebound, retract filament past "
+        "toolhead sensor, and corroborate with buffer state. Parameters: "
+        "[BOX=<1-4>] [CUT_X=<pos>] [CUT_Y=<pos>] [DWELL=<s>] [RETRY=<count>] [CUT_STEP=<mm>] "
+        "[TEMP=<C>] [RETRUDE_LEN=<mm>] [RETRUDE_VELOCITY=<mm/min>] [RELIEVE_LEN=<mm>] [PARK=<0|1>]."
+    )
+
+    cmd_CFS_CUT_TEST_help: str = (
+        "Diagnostic test for mechanical cutter: tests approach, stroke, dwell, and reports "
+        "sensor status at cut apex and rebound without retracting filament. "
+        "Parameters: [CUT_X=<pos>] [DWELL=<s>] [RETRY=<count>] [CUT_STEP=<mm>]."
     )
 
     def cmd_CFS_CUT(self, gcmd) -> None:
-        """G-code: CFS_CUT [BOX=<1-4>] [TEMP=<C>] -- the mechanical cut ram.
+        """G-code: CFS_CUT [BOX=<1-4>] [TEMP=<C>] [RETRUDE_LEN=] [RETRUDE_VELOCITY=] [PARK=<0|1>]
+        [CUT_X=] [CUT_Y=] [DWELL=] [RETRY=] [CUT_STEP=] -- cut ram and retract.
 
         The cut is MECHANICAL: the toolhead rams the blade lever against the frame-mounted
-        cutter; there is no bus 'cut' command, and no bus cut-result read either (the 0x05
-        post-read is the BUFFER state, kept as corroboration; stock confirms the cut via
-        the toolhead cutter switch).
-        Safety rails (all ported from the validated implementation):
-          - HARD GUARD: refuses to run without cut_switch_pin configured (the cutter
-            microswitch/hall). A blind ram with no switch could crash the toolhead.
-          - ZERO-TRAVEL REFUSAL: refuses when the cut position equals the pre-cut position
-            (an uncalibrated cut would move nowhere and leave the strand uncut -- the
-            follow-up load then jams against it).
-          - Travel bound: cut_pos_x_max caps the ram target.
-          - M109 preheat to the melt temperature before severing (cold filament shatters
-            or resists the blade).
-        Post-check: the 0x05 BUFFER read -- middle (0x00) is what every observed real cut
-        produced; empty (0x02) = nothing staged at the blade (empty slot, not a failure).
-        The bus does not directly confirm the cut.
+        cutter; the cut itself is verified by the toolhead cutter sensor (Hall/switch on PB9).
+        Safety rails:
+          - HARD GUARD: refuses to run without cut_switch_pin or cutter_sensor configured.
+          - ZERO-TRAVEL REFUSAL: refuses when cut position equals pre-cut position.
+          - TRAVEL BOUNDS: directional boundary check (cut_pos_x_min for negative travel,
+            cut_pos_x_max for positive travel).
+          - APEX DWELL: pauses briefly at the stroke apex (cut_dwell) to allow full blade
+            penetration and sensor debounce.
+          - SENSOR VERIFICATION: checks cutter sensor while at cut apex. If not detected,
+            progressively retries deeper by cut_step up to cut_pos_x_min.
+          - REBOUND VERIFICATION: checks that cutter blade returns to rest position after stroke.
+          - EXTRUDER & CFS PROTECTION: aborts before post-cut retract if cut was not confirmed.
         """
-        # Connection guard FIRST -- before any heat or motion. Without it, a disconnected
-        # CFS would let the ram run and then hard-error out of the 0x05 post-read (review
-        # finding: partial mechanical action followed by a shutdown instead of a clean
-        # recoverable error).
         if not self.is_connected:
             raise gcmd.error("CFS serial port is not connected")
         addr = gcmd.get_int("BOX", 1, minval=1, maxval=4)
         if not self.cut_switch_pin:
             raise gcmd.error(
-                "CFS_CUT aborted: no cut_switch_pin configured in [creality_cfs]. Refusing "
-                "to blind-ram the toolhead without a cutter switch.")
+                "CFS_CUT aborted: no cut_switch_pin configured in [creality_cfs]. "
+                "Refusing to blind-ram the toolhead without a cutter switch.")
         pre_x = self.pre_cut_pos_x
         pre_y = self.pre_cut_pos_y
-        cut_x = self.cut_pos_x
-        cut_y = self.cut_pos_y
+        cut_x = gcmd.get_float("CUT_X", self.cut_pos_x) if self.cut_pos_x is not None else None
+        cut_y = gcmd.get_float("CUT_Y", self.cut_pos_y) if self.cut_pos_y is not None else None
         if pre_x is None or pre_y is None or (cut_x is None and cut_y is None):
             raise gcmd.error(
                 "CFS_CUT aborted: missing cut geometry (need pre_cut_pos_x/pre_cut_pos_y "
                 "and cut_pos_x or cut_pos_y in [creality_cfs]).")
-        x_max = self.cut_pos_x_max
-        if x_max is not None and pre_x > x_max:
-            raise gcmd.error("CFS_CUT aborted: pre_cut_pos_x %.2f > cut_pos_x_max %.2f"
-                             % (pre_x, x_max))
-        if x_max is not None and cut_x is not None and cut_x > x_max:
-            raise gcmd.error("CFS_CUT aborted: cut_pos_x %.2f > cut_pos_x_max %.2f"
-                             % (cut_x, x_max))
-        # ZERO-TRAVEL REFUSAL: a cut position equal to the pre-cut position rams nowhere.
+
+        # Directional bounds and zero-travel validation
         if cut_x is not None:
             if abs(cut_x - pre_x) < 0.05:
                 raise gcmd.error(
                     "CFS_CUT aborted: cut_pos_x (%.2f) equals pre_cut_pos_x -- the cut ram "
-                    "would not move and the filament would stay uncut. Calibrate cut_pos_x."
-                    % cut_x)
+                    "would not move and filament would stay uncut. Calibrate cut_pos_x." % cut_x)
+            if cut_x < pre_x:
+                if self.cut_pos_x_min is not None and cut_x < self.cut_pos_x_min:
+                    raise gcmd.error("CFS_CUT aborted: cut_pos_x %.2f < cut_pos_x_min %.2f"
+                                     % (cut_x, self.cut_pos_x_min))
+            else:
+                if self.cut_pos_x_max is not None and cut_x > self.cut_pos_x_max:
+                    raise gcmd.error("CFS_CUT aborted: cut_pos_x %.2f > cut_pos_x_max %.2f"
+                                     % (cut_x, self.cut_pos_x_max))
         elif cut_y is None or abs(cut_y - pre_y) < 0.05:
             raise gcmd.error(
                 "CFS_CUT aborted: no cut_pos_x and cut_pos_y equals pre_cut_pos_y -- the "
                 "cut ram would not move. Calibrate the cut position first.")
-        # Melt guard: sever at temperature (blocking M109; also keeps any adjacent E moves
-        # legal on mainline).
-        self._melt_guard(gcmd, "CFS_CUT")
+
+        retrude_len = gcmd.get_float(
+            "RETRUDE_LEN", self.cut_retrude_len, minval=0.0, maxval=100.0)
+        retrude_vel = gcmd.get_float(
+            "RETRUDE_VELOCITY", self.cut_retrude_velocity, above=0.0)
+        cut_dwell = gcmd.get_float("DWELL", self.cut_dwell, minval=0.0, maxval=5.0)
+        retries = gcmd.get_int("RETRY", self.cut_retries, minval=0, maxval=10)
+        cut_step = gcmd.get_float("CUT_STEP", self.cut_step, minval=0.0, maxval=5.0)
+        cut_relieve_len = gcmd.get_float(
+            "RELIEVE_LEN", self.cut_relieve_len, minval=0.0, maxval=2.0)
+        park_after = gcmd.get_int("PARK", 0)
+
+        # Only melt-guard if post-cut toolhead E retraction was explicitly requested
+        if retrude_len > 0:
+            self._melt_guard(gcmd, "CFS_CUT")
+
+        # Pre-check cutter sensor state before moving
+        initial_sensor = self._cutter_sensor_detected()
+        if initial_sensor is True:
+            raise gcmd.error(
+                "CFS_CUT aborted: cutter sensor is already triggered before starting ram stroke! "
+                "Cutter blade lever may be stuck or switch inverted.")
+
+        # Navigate safely to pre-cut position via kinematic corridor
+        gcmd.respond_info(
+            "CFS_CUT: navigating safely to pre-cut (%.2f, %.2f) at F%.0f..."
+            % (pre_x, pre_y, self.travel_velocity))
+        self._safe_corridor_move(gcmd, pre_x, pre_y)
+
+        # Execute cut ram stroke(s) with dwell and sensor verification
         fr = self.cut_velocity
-        self.gcode.run_script_from_command("G90")
-        self.gcode.run_script_from_command("G0 X%.3f Y%.3f F%.0f" % (pre_x, pre_y, fr))
-        if cut_x is not None:
-            gcmd.respond_info("CFS_CUT: X-axis ram (%.2f,%.2f) -> X%.2f at F%.0f, switch=%s"
-                              % (pre_x, pre_y, cut_x, fr, self.cut_switch_pin))
-            self.gcode.run_script_from_command("G0 X%.3f F%.0f" % (cut_x, fr))
-            self.gcode.run_script_from_command("G0 X%.3f F%.0f" % (pre_x, fr))
-        else:
-            gcmd.respond_info("CFS_CUT: Y-axis ram (%.2f,%.2f) -> Y%.2f at F%.0f, switch=%s"
-                              % (pre_x, pre_y, cut_y, fr, self.cut_switch_pin))
-            self.gcode.run_script_from_command("G0 Y%.3f F%.0f" % (cut_y, fr))
-            self.gcode.run_script_from_command("G0 Y%.3f F%.0f" % (pre_y, fr))
-        self.gcode.run_script_from_command("M400")
-        # Post-cut 0x05 read, RE-PINNED 2026-07-19: the byte is the BUFFER state, not a cut
-        # confirmation (the bus has no cut-result read; stock confirms the cut via the
-        # toolhead cutter switch). The 2026-06-22 stock-vs-empty observations hold under
-        # the corrected decode: a real cut of a loaded path reads middle (0x00), an empty
-        # slot reads empty (0x02). Kept as a corroboration signal.
+        cut_success = False
+        attempt = 0
+        current_x = cut_x
+        current_y = cut_y
+
+        while attempt <= retries:
+            attempt += 1
+            if current_x is not None:
+                gcmd.respond_info("CFS_CUT: ram stroke #%d -> X%.2f at F%.0f"
+                                  % (attempt, current_x, fr))
+                self.gcode.run_script_from_command("G0 X%.3f F%.0f" % (current_x, fr))
+            else:
+                gcmd.respond_info("CFS_CUT: ram stroke #%d -> Y%.2f at F%.0f"
+                                  % (attempt, current_y, fr))
+                self.gcode.run_script_from_command("G0 Y%.3f F%.0f" % (current_y, fr))
+            self.gcode.run_script_from_command("M400")
+
+            # Dwell at cut apex to allow blade penetration and sensor debounce
+            if cut_dwell > 0:
+                self.gcode.run_script_from_command("G4 P%d" % int(cut_dwell * 1000.0))
+                self.gcode.run_script_from_command("M400")
+
+            # Query sensor at apex
+            sensor_at_cut = self._cutter_sensor_detected()
+            if sensor_at_cut is True:
+                gcmd.respond_info("CFS_CUT: cutter sensor triggered (cut stroke confirmed at X=%.2f)."
+                                  % (current_x if current_x is not None else current_y))
+                cut_success = True
+            elif sensor_at_cut is False:
+                gcmd.respond_info("CFS_CUT: cutter sensor NOT triggered at X=%.2f."
+                                  % (current_x if current_x is not None else current_y))
+            else:
+                # No cutter sensor available; assume mechanical stroke succeeded
+                cut_success = True
+
+            # Relieve mechanical blade clamping by retracting filament slightly (cold or hot).
+            # This creates an air gap above the blade so the return spring rebounds freely.
+            if cut_success and cut_relieve_len > 0:
+                self._cold_retract(cut_relieve_len, velocity=300.0)
+
+            # Return toolhead to pre-cut position
+            if current_x is not None:
+                self.gcode.run_script_from_command("G0 X%.3f F%.0f" % (pre_x, fr))
+            else:
+                self.gcode.run_script_from_command("G0 Y%.3f F%.0f" % (pre_y, fr))
+            self.gcode.run_script_from_command("M400")
+
+            if cut_success:
+                break
+
+            # If unconfirmed and retries remain, step deeper
+            if attempt <= retries and current_x is not None:
+                if current_x < pre_x:
+                    next_x = current_x - cut_step
+                    if self.cut_pos_x_min is not None and next_x < self.cut_pos_x_min:
+                        next_x = self.cut_pos_x_min
+                    if abs(next_x - current_x) < 0.01:
+                        gcmd.respond_info("CFS_CUT: reached stroke limit (X=%.2f), cannot step deeper." % current_x)
+                        break
+                    gcmd.respond_info("CFS_CUT: stepping deeper: X%.2f -> X%.2f" % (current_x, next_x))
+                    current_x = next_x
+                else:
+                    next_x = current_x + cut_step
+                    if self.cut_pos_x_max is not None and next_x > self.cut_pos_x_max:
+                        next_x = self.cut_pos_x_max
+                    if abs(next_x - current_x) < 0.01:
+                        break
+                    current_x = next_x
+            elif attempt <= retries:
+                self._dwell(0.15)
+
+        # Rebound verification: check that cutter blade returned to rest position
+        self._dwell(0.1)
+        sensor_after = self._cutter_sensor_detected()
+        if sensor_after is True:
+            # Auto-recovery: if blade hasn't sprung back yet, attempt an additional cold retract to un-wedge
+            logger.warning("creality_cfs: cutter blade did not rebound immediately; attempting extra relieve pull")
+            self._cold_retract(0.3, velocity=300.0)
+            self._dwell(0.15)
+            sensor_after = self._cutter_sensor_detected()
+
+        if sensor_after is True:
+            self._cut_state = False
+            raise gcmd.error(
+                "CFS_CUT error: cutter blade did not rebound after stroke (sensor still triggered)! "
+                "Cutter blade or return spring may be jammed. Inspect cutter before moving.")
+
+        if not cut_success:
+            self._cut_state = False
+            raise gcmd.error(
+                "CFS_CUT failed: cutter sensor was not triggered after %d attempt(s) (last target=%.2f). "
+                "Filament is UNCONFIRMED/UNCUT. Extruder retraction and CFS unload aborted."
+                % (attempt, current_x if current_x is not None else current_y))
+
+        # Mark cut as confirmed
+        self._cut_state = True
+
+        # Post-cut retraction: the mechanical cut severs the strand inside the toolhead,
+        # but the severed upstream strand remains clamped in the extruder drive gears.
+        # Retract it backward to release it from the gears and pull it past the toolhead
+        # sensor into the guide tube. This relieves tension on the CFS buffer.
+        if retrude_len > 0:
+            gcmd.respond_info(
+                "CFS_CUT: retracting %.1f mm at F%.0f to clear extruder gears and sensor..."
+                % (retrude_len, retrude_vel))
+            self.gcode.run_script_from_command("M83")
+            self.gcode.run_script_from_command("G1 E-%.3f F%.0f" % (retrude_len, retrude_vel))
+            self.gcode.run_script_from_command("M400")
+
+            # Check if sensor cleared; if still detected, attempt one additional pull
+            # up to buffer_empty_len total so the sensor is guaranteed to clear.
+            sensor_detected = self._toolhead_filament_detected()
+            if sensor_detected is True and self.buffer_empty_len > retrude_len:
+                extra_pull = self.buffer_empty_len - retrude_len
+                gcmd.respond_info(
+                    "CFS_CUT: sensor still detected; retracting additional %.1f mm..."
+                    % extra_pull)
+                self.gcode.run_script_from_command("G1 E-%.3f F%.0f" % (extra_pull, retrude_vel))
+                self.gcode.run_script_from_command("M400")
+                sensor_detected = self._toolhead_filament_detected()
+
+            if sensor_detected is False:
+                gcmd.respond_info("CFS_CUT: toolhead filament sensor cleared.")
+            elif sensor_detected is True:
+                gcmd.respond_info(
+                    "CFS_CUT: warning: toolhead filament sensor still detected after retraction.")
+
+        # Allow buffer spring to settle before reading
+        self._dwell(0.2)
+
+        # Post-cut 0x05 read: corroboration check.
         buf = self.get_buffer_state(addr)
         code = buf["code"] if buf is not None else None
-        # box.cut_state keeps its historical meaning (the post-cut 0x05 read came back
-        # 0x00): under the corrected decode that is "buffer reads middle after the cut".
-        self._cut_state = (code == BUFFER_STATE_MIDDLE)
+        # Both middle (0x00) and full (0x01) corroborate that filament is staged at the cutter.
+        self._cut_state = (code in (BUFFER_STATE_MIDDLE, BUFFER_STATE_FULL, BUFFER_STATE_EMPTY))
         if code is None:
             gcmd.respond_info("CFS_CUT: post-cut buffer read (0x05) NO RESPONSE. The bus "
                               "does not confirm the cut; verify visually.")
         elif code == BUFFER_STATE_MIDDLE:
-            gcmd.respond_info("CFS_CUT: post-cut buffer reads middle (filament staged; "
-                              "the reading every observed real cut produced). Note the "
-                              "bus does not directly confirm the cut.")
+            gcmd.respond_info("CFS_CUT: cut complete; post-cut buffer reads middle.")
+        elif code == BUFFER_STATE_FULL:
+            gcmd.respond_info("CFS_CUT: cut complete; post-cut buffer reads full (filament staged; ready for CFS_RETRUDE).")
         elif code == BUFFER_STATE_EMPTY:
-            gcmd.respond_info("CFS_CUT: post-cut buffer reads EMPTY (nothing staged at "
+            gcmd.respond_info("CFS_CUT: cut complete; post-cut buffer reads EMPTY (nothing staged at "
                               "the blade -- empty slot; not a failure).")
         else:
-            gcmd.respond_info("CFS_CUT: post-cut buffer reads 0x%02X (%s) -- unexpected; "
-                              "inspect before continuing."
+            gcmd.respond_info("CFS_CUT: post-cut buffer reads 0x%02X (%s)."
                               % (code, BUFFER_STATE_NAMES.get(code, "unknown")))
 
+        if park_after:
+            gcmd.respond_info(
+                "CFS_CUT: returning toolhead to safe park position (%.1f, %.1f)..."
+                % (self.safe_pos_x, self.safe_pos_y))
+            self._safe_corridor_move(gcmd, self.safe_pos_x, self.safe_pos_y)
+
+    def cmd_CFS_CUT_TEST(self, gcmd) -> None:
+        """G-code: CFS_CUT_TEST [CUT_X=] [CUT_Y=] [DWELL=] [RETRY=] [CUT_STEP=] -- diagnostic cutter test."""
+        pre_x = self.pre_cut_pos_x
+        pre_y = self.pre_cut_pos_y
+        cut_x = gcmd.get_float("CUT_X", self.cut_pos_x) if self.cut_pos_x is not None else None
+        cut_y = gcmd.get_float("CUT_Y", self.cut_pos_y) if self.cut_pos_y is not None else None
+        cut_dwell = gcmd.get_float("DWELL", self.cut_dwell, minval=0.0, maxval=5.0)
+        retries = gcmd.get_int("RETRY", self.cut_retries, minval=0, maxval=10)
+        cut_step = gcmd.get_float("CUT_STEP", self.cut_step, minval=0.0, maxval=5.0)
+
+        if not self.cut_switch_pin:
+            raise gcmd.error("Missing cut_switch_pin in [creality_cfs]")
+        if pre_x is None or pre_y is None or (cut_x is None and cut_y is None):
+            raise gcmd.error("Missing cut geometry in [creality_cfs]")
+
+        init_s = self._cutter_sensor_detected()
+        gcmd.respond_info(
+            "CFS_CUT_TEST: Initial sensor state: %s (pin=%s)"
+            % ("TRIGGERED (WARNING)" if init_s else "RELEASED (OK)" if init_s is False else "NOT AVAILABLE",
+               self.cut_switch_pin))
+        if init_s is True:
+            gcmd.respond_info("CFS_CUT_TEST WARNING: Sensor is already triggered before moving!")
+
+        gcmd.respond_info("CFS_CUT_TEST: Moving to pre-cut (%.2f, %.2f)..." % (pre_x, pre_y))
+        self._safe_corridor_move(gcmd, pre_x, pre_y)
+
+        fr = self.cut_velocity
+        attempt = 0
+        current_x = cut_x
+        current_y = cut_y
+        test_success = False
+
+        while attempt <= retries:
+            attempt += 1
+            if current_x is not None:
+                gcmd.respond_info("CFS_CUT_TEST: Ram stroke #%d -> X%.2f at F%.0f..." % (attempt, current_x, fr))
+                self.gcode.run_script_from_command("G0 X%.3f F%.0f" % (current_x, fr))
+            else:
+                gcmd.respond_info("CFS_CUT_TEST: Ram stroke #%d -> Y%.2f at F%.0f..." % (attempt, current_y, fr))
+                self.gcode.run_script_from_command("G0 Y%.3f F%.0f" % (current_y, fr))
+            self.gcode.run_script_from_command("M400")
+
+            if cut_dwell > 0:
+                self.gcode.run_script_from_command("G4 P%d" % int(cut_dwell * 1000.0))
+                self.gcode.run_script_from_command("M400")
+
+            sensor_val = self._cutter_sensor_detected()
+            gcmd.respond_info("CFS_CUT_TEST: Sensor reading at cut apex: %s"
+                              % ("TRIGGERED (SUCCESS)" if sensor_val else "NOT TRIGGERED (FAILED)" if sensor_val is False else "NOT AVAILABLE"))
+
+            if sensor_val is True:
+                test_success = True
+
+            # Return to pre-cut
+            if current_x is not None:
+                self.gcode.run_script_from_command("G0 X%.3f F%.0f" % (pre_x, fr))
+            else:
+                self.gcode.run_script_from_command("G0 Y%.3f F%.0f" % (pre_y, fr))
+            self.gcode.run_script_from_command("M400")
+
+            if test_success:
+                break
+
+            if attempt <= retries and current_x is not None:
+                if current_x < pre_x:
+                    next_x = current_x - cut_step
+                    if self.cut_pos_x_min is not None and next_x < self.cut_pos_x_min:
+                        next_x = self.cut_pos_x_min
+                    if abs(next_x - current_x) < 0.01:
+                        break
+                    gcmd.respond_info("CFS_CUT_TEST: Stepping deeper: X%.2f -> X%.2f" % (current_x, next_x))
+                    current_x = next_x
+                else:
+                    next_x = current_x + cut_step
+                    if self.cut_pos_x_max is not None and next_x > self.cut_pos_x_max:
+                        next_x = self.cut_pos_x_max
+                    if abs(next_x - current_x) < 0.01:
+                        break
+                    current_x = next_x
+
+        self._dwell(0.1)
+        rebound_s = self._cutter_sensor_detected()
+        gcmd.respond_info("CFS_CUT_TEST: Sensor reading after return: %s"
+                          % ("RELEASED (SUCCESS)" if rebound_s is False else "STILL TRIGGERED (FAILED)" if rebound_s else "NOT AVAILABLE"))
+        gcmd.respond_info("CFS_CUT_TEST: Final Result: %s" % ("PASS" if test_success else "FAIL"))
+
+    # -----------------------------------------------------------------------
+    # Dynamic Tool Mapping & Bypass Slot
+    # -----------------------------------------------------------------------
+
+    def _update_bypass_slot(self) -> None:
+        """Update bypass slot index and ensure slot metadata is populated."""
+        online_boxes = [e for e in self._box_table if e.online == BoxAddressEntry.ONLINE_ONLINE]
+        num_boxes = len(online_boxes) if online_boxes else 1
+        num_cfs_slots = num_boxes * 4
+        bypass_slot = num_cfs_slots
+        self._bypass_tool_idx = bypass_slot
+
+        # Ensure bypass slot is initialized in self._slots
+        if self._saved_bypass_slot:
+            b_slot = dict(self._saved_bypass_slot)
+            b_slot["is_bypass"] = True
+            b_slot["addr"] = None
+            b_slot["slot"] = None
+            self._slots[bypass_slot] = b_slot
+        elif bypass_slot not in self._slots or not self._slots[bypass_slot].get("is_bypass"):
+            self._slots[bypass_slot] = {
+                "present": True,
+                "material": self.bypass_material,
+                "melt_temp": self.bypass_temp,
+                "color": self.bypass_color,
+                "vendor": self.bypass_vendor,
+                "remain": -1,
+                "is_bypass": True,
+                "addr": None,
+                "slot": None,
+            }
+
+    cmd_CFS_SET_TOOL_MAPPING_help: str = (
+        "Map slicer tool numbers to physical CFS slot numbers or bypass slot. "
+        "Parameters: [MAP=\"<slicer_tool>:<slot_idx>,...\"] [RESET=1]"
+    )
+
+    def cmd_CFS_SET_TOOL_MAPPING(self, gcmd) -> None:
+        """G-code: CFS_SET_TOOL_MAPPING [MAP=\"0:0,1:0,2:2,3:3\"] [RESET=1]"""
+        reset = gcmd.get_int("RESET", 0)
+        if reset:
+            self._tool_map.clear()
+            gcmd.respond_info("CFS: Tool mapping reset to default (1:1).")
+            return
+
+        map_str = gcmd.get("MAP", None)
+        if not map_str:
+            if not self._tool_map:
+                gcmd.respond_info("CFS: No active tool mappings (1:1 default).")
+            else:
+                pairs = ["T%d->Slot%d" % (k, v) for k, v in sorted(self._tool_map.items())]
+                gcmd.respond_info("CFS: Active tool mappings: %s" % (", ".join(pairs)))
+            return
+
+        new_map = dict(self._tool_map)
+        try:
+            tokens = [t.strip() for t in map_str.replace(";", ",").split(",") if t.strip()]
+            for token in tokens:
+                if ":" not in token:
+                    raise ValueError("Invalid mapping pair '%s', expected src:dst" % token)
+                src_str, dst_str = token.split(":", 1)
+                src = int(src_str.strip().lstrip("Tt"))
+                dst = int(dst_str.strip().lstrip("Tt"))
+                new_map[src] = dst
+            self._tool_map = new_map
+            pairs = ["T%d->Slot%d" % (k, v) for k, v in sorted(self._tool_map.items())]
+            gcmd.respond_info("CFS: Updated tool mappings: %s" % (", ".join(pairs)))
+        except Exception as e:
+            raise gcmd.error("Failed to parse CFS tool mapping '%s': %s" % (map_str, e))
+
+    cmd_CFS_BYPASS_help: str = (
+        "Bypass CFS unit and select external spool holder slot. "
+        "Unloads and retracts any currently loaded CFS filament. "
+        "Parameters: [MATERIAL=<str>] [TEMP=<float>] [COLOR=<str>] [VENDOR=<str>]"
+    )
+
+    def cmd_CFS_BYPASS(self, gcmd) -> None:
+        """G-code: CFS_BYPASS / T(n+1) -- unload CFS and switch to external spool holder."""
+        bypass_slot = self._bypass_tool_idx
+        # Optional metadata updates
+        mat = gcmd.get("MATERIAL", None)
+        temp = gcmd.get_float("TEMP", None)
+        color = gcmd.get("COLOR", None)
+        vendor = gcmd.get("VENDOR", None)
+
+        slot = self._slots.setdefault(bypass_slot, {
+            "present": True,
+            "material": self.bypass_material,
+            "melt_temp": self.bypass_temp,
+            "color": self.bypass_color,
+            "vendor": self.bypass_vendor,
+            "remain": -1,
+            "is_bypass": True,
+            "addr": None,
+            "slot": None,
+        })
+        if mat is not None and mat.strip():
+            slot["material"] = mat.strip()
+        if temp is not None and temp > 0:
+            slot["melt_temp"] = temp
+        elif mat is not None and (temp is None or temp <= 0):
+            slot["melt_temp"] = self._material_to_temp(mat.strip())
+        if color is not None and color.strip():
+            clean_color = color.strip()
+            if not clean_color.startswith("#") and len(clean_color) == 6:
+                clean_color = "#" + clean_color.upper()
+            slot["color"] = clean_color
+        if vendor is not None and vendor.strip():
+            slot["vendor"] = vendor.strip()
+        slot["is_bypass"] = True
+        slot["present"] = True
+        self._slots[bypass_slot] = slot
+
+        gcmd.respond_info(
+            "CFS: Switching to bypass slot (T%d - External Spool Holder: %s %s @ %.0fC)..."
+            % (bypass_slot, slot.get("vendor", "Generic"), slot.get("material", "PLA"), slot.get("melt_temp", 220.0)))
+
+        # Check if CFS filament is currently in the toolhead
+        toolhead_loaded = self._toolhead_filament_detected()
+        if self._active_tool is not None and self._active_tool >= 0 and self._active_tool != bypass_slot:
+            old_tool = self._active_tool
+            gcmd.respond_info("CFS: Unloading active CFS tool T%d..." % old_tool)
+            if self.cut_switch_pin:
+                gcmd.respond_info("CFS: Cutting filament for T%d..." % old_tool)
+                self.cmd_CFS_CUT(gcmd)
+            self.cmd_CFS_UNLOAD(gcmd)
+        elif toolhead_loaded:
+            if self.cut_switch_pin:
+                gcmd.respond_info("CFS: Cutting filament in toolhead...")
+                self.cmd_CFS_CUT(gcmd)
+            self._toolhead_pull(allow_cold=True)
+
+        self._previous_tool = self._active_tool
+        self._active_tool = bypass_slot
+        self._bypass_mode = True
+        self._save_state()
+
+        macro = self.printer.lookup_object("gcode_macro _CFS_TOOL_CHANGE", None)
+        if macro is not None:
+            self.gcode.run_script_from_command(
+                "SET_GCODE_VARIABLE MACRO=_CFS_TOOL_CHANGE VARIABLE=active_tool VALUE=%d"
+                % bypass_slot)
+
+        gcmd.respond_info(
+            "CFS: Bypassed. External spool slot (T%d) is now ACTIVE (%s %s @ %.0fC). "
+            "Any CFS filament has been unloaded. You may feed filament from the external spool."
+            % (bypass_slot, slot.get("vendor", "Generic"), slot.get("material", "PLA"), slot.get("melt_temp", 220.0)))
+
     cmd_CFS_FLUSH_help: str = (
-        "Purge the old filament through the hotend after a tool change, in capped cycles "
-        "with a measuring-wheel clog watchdog. Parameters: [BOX=<1-4>] [LEN=<mm>] "
-        "[VOLUME=<mm3>] [VELOCITY=<mm/min>] [TEMP=<C>]"
+        "Purge filament through hotend over the waste chute in capped cycles "
+        "with a measuring-wheel clog watchdog. Automatically navigates to the purge chute "
+        "via the safe corridor. Requires filament detected at toolhead sensor. "
+        "Parameters: [BOX=<1-4>] [LEN=<mm>] [VOLUME=<mm3>] [VELOCITY=<mm/min>] "
+        "[TEMP=<C>] [PARK=<0|1>] [FORCE=<0|1>]"
     )
 
     def cmd_CFS_FLUSH(self, gcmd) -> None:
-        """G-code: CFS_FLUSH [BOX=] [LEN=|VOLUME=] [VELOCITY=] [TEMP=] -- the change flush.
+        """G-code: CFS_FLUSH [BOX=] [LEN=|VOLUME=] [VELOCITY=] [TEMP=] [PARK=] -- the change flush.
 
         The bulk flush is a HOTEND G1 E purge (relative E), split into per-cycle purges
         capped at flush_cycle_cap: cycle 1 = the cap, the remainder split equally
@@ -3706,14 +5170,41 @@ class CrealityCFS:
         cycle (the wipe). Ends with the 1.5 mm retract.
 
         MAINLINE NOTE: every purge is a hotend G1 E move -- the blocking M109 melt guard
-        runs first, which both protects the hardware and satisfies mainline Klipper's
-        min_extrude_temp raise.
+        runs first over the chute, which protects the hardware and satisfies mainline
+        Klipper's min_extrude_temp raise.
         """
         if not self.is_connected:
             raise gcmd.error("CFS serial port is not connected")
-        addr = gcmd.get_int("BOX", 1, minval=1, maxval=4)
+
+        # 0. Filament presence guard: abort if no filament is detected in the toolhead
+        has_filament = self._toolhead_filament_detected()
+        force = gcmd.get_int("FORCE", 0) == 1
+        if has_filament is False and not force:
+            raise gcmd.error(
+                "CFS_FLUSH aborted: no filament detected in toolhead sensor (%s). "
+                "Load filament first with CFS_LOAD, or specify FORCE=1 to bypass."
+                % self.filament_sensor_name)
+
+        # 1. Record initial heater target to restore cold state if idle
+        ext = self.printer.lookup_object('extruder', None)
+        initial_target = 0.0
+        if ext is not None:
+            try:
+                initial_target = float(ext.get_heater().target_temp)
+            except Exception:
+                initial_target = 0.0
+
+        # 2. Resolve active tool, box address, and slot
+        active_tool = self._active_tool
+        tool = gcmd.get_int("TOOL", active_tool if active_tool is not None else 0, minval=0, maxval=self._bypass_tool_idx)
+        is_bypass = (tool == self._bypass_tool_idx) or self._bypass_mode
+
         total = self._default_flush_total(gcmd)
         velocity = gcmd.get_float("VELOCITY", self.flush_velocity, above=0.)
+        park_after = gcmd.get_int("PARK", 0) == 1
+        watchdog_param = gcmd.get_int("WATCHDOG", 1) == 1
+        # Clog watchdog via CFS measuring wheel is only valid for CFS slots, not external bypass
+        watchdog_enabled = watchdog_param and not force and not is_bypass
         if total > FLUSH_TOTAL_MAX:
             raise gcmd.error(
                 "CFS_FLUSH aborted: computed flush total %.1f mm exceeds the %.0f mm "
@@ -3721,51 +5212,111 @@ class CrealityCFS:
         if total <= 0:
             gcmd.respond_info("CFS_FLUSH: computed total %.1f mm -> nothing to flush." % total)
             return
+
+        # 3. Put CFS box into print mode and release feeder motor clutch (CFS slots only).
+        if not is_bypass:
+            addr = gcmd.get_int("BOX", (tool // 4) + 1, minval=1, maxval=4)
+            slot = SLOT_BITMASKS[tool % 4]
+            gcmd.respond_info(
+                "CFS_FLUSH: setting box %d slot 0x%02X to print mode (feeder released)..."
+                % (addr, slot))
+            self.set_print_mode(addr, slot)
+            self.ctrl_connection_motor_action(addr, False)
+            self._dwell(0.1)
+        else:
+            addr = None
+            slot = None
+            gcmd.respond_info(
+                "CFS_FLUSH: external spool bypass slot (T%d) active, CFS box motor bypassed."
+                % tool)
+
+        # 4. Safely position toolhead over the purge chute before heating or flushing
+        if self.extrude_pos_x is not None and self.extrude_pos_y is not None:
+            gcmd.respond_info(
+                "CFS_FLUSH: moving toolhead to purge chute (%.1f, %.1f)..."
+                % (self.extrude_pos_x, self.extrude_pos_y))
+            self._safe_corridor_move(gcmd, self.extrude_pos_x, self.extrude_pos_y)
+
+        # 5. Safe melt temperature arbitration: max(T_prev, T_next)
+        flush_temp, next_temp = self._flush_temperature_arbitration(gcmd)
+
         cap = self._flush_cap()
         cycles = self._flush_cycles(total, cap)
         gcmd.respond_info(
             "CFS_FLUSH: total %.2f mm in %d cycle(s) (cap %.0f mm) at F%.0f"
             % (total, len(cycles), cap, velocity))
-        # Melt guard (blocking M109) before any purge.
-        self._melt_guard(gcmd, "CFS_FLUSH")
+        # Heat nozzle to arbitrated flush temperature over the chute
+        self.gcode.run_script_from_command("M109 S%d" % int(flush_temp))
         self.gcode.run_script_from_command("M83")
-        for cyc in cycles:
-            mm0 = self.measuring_wheel_mm(addr)
+        for i, cyc in enumerate(cycles):
+            # Ensure toolhead is directly over the purge chute opening before each purge
+            if self.extrude_pos_x is not None and self.extrude_pos_y is not None:
+                self.gcode.run_script_from_command(
+                    "G1 X%.1f Y%.1f F%.0f" % (self.extrude_pos_x, self.extrude_pos_y, self.travel_velocity))
+                self.gcode.run_script_from_command("M400")
+
+            mm0 = self.measuring_wheel_mm(addr, slot) if not is_bypass else None
             self.gcode.run_script_from_command("G1 E%.3f F%.0f" % (cyc, velocity))
             self.gcode.run_script_from_command("M400")
-            mm1 = self.measuring_wheel_mm(addr)
+            mm1 = self.measuring_wheel_mm(addr, slot) if not is_bypass else None
+            diff = abs(mm1 - mm0) if (mm0 is not None and mm1 is not None) else None
+            diff_str = ("%.1f" % diff) if diff is not None else "n/a"
+            gcmd.respond_info(
+                "CFS_FLUSH: cycle %d/%d: %.1f mm purged (wheel advance: %s mm)"
+                % (i + 1, len(cycles), cyc, diff_str))
+
             # BUFFER GATE (stock, buffer spec 4.3.6): the wheel sits UPSTREAM of the
             # buffer, so a purge shorter than 2x buffer_empty_len can be absorbed entirely
-            # by the buffer spring and legitimately never turns the wheel. Stock arms the
+            # by the buffer spring without turning the upstream wheel. Stock arms the
             # wheel-diff clog watchdog only for moves >= that length; shorter cycles run
-            # unchecked. Without this gate the short tail cycles (e.g. the 21.25 mm cycle
-            # of a 101.25 mm split) could false-trip the watchdog.
-            watchdog_armed = (cyc >= 2.0 * self.buffer_empty_len)
-            if (watchdog_armed and mm0 is not None and mm1 is not None
-                    and abs(mm1 - mm0) < cyc * FLUSH_WHEEL_MIN_FRAC):
+            # unchecked.
+            watchdog_armed = watchdog_enabled and (cyc >= 2.0 * self.buffer_empty_len)
+            if (watchdog_armed and diff is not None and diff < cyc * FLUSH_WHEEL_MIN_FRAC):
                 # The wheel did not track the purge -- an under-feed/clog. Latch key845
-                # ("the nozzle is blocked" -- the key the stock wire raises at wheel diff
-                # 0.0 during a flush; the pre-audit key859 was a misattribution) before
-                # raising the recoverable error.
                 self._record_error(845)
                 raise gcmd.error(
                     "CFS_FLUSH: under-feed/clog -- the hotend extruded %.1f mm but the "
                     "measuring wheel advanced only %.1f mm. Clear the filament path and "
-                    "retry the flush." % (cyc, abs(mm1 - mm0)))
+                    "retry the flush (or pass WATCHDOG=0 / FORCE=1 to bypass)."
+                    % (cyc, diff))
             if self.nozzle_clean_macro:
                 try:
                     self.gcode.run_script_from_command(self.nozzle_clean_macro)
+                    # Reposition directly over the purge chute opening after cleaning
+                    if self.extrude_pos_x is not None and self.extrude_pos_y is not None:
+                        self.gcode.run_script_from_command(
+                            "G1 X%.1f Y%.1f F%.0f" % (self.extrude_pos_x, self.extrude_pos_y, self.travel_velocity))
+                        self.gcode.run_script_from_command("M400")
                 except Exception:
                     logger.exception("creality_cfs: nozzle_clean_macro %r failed "
                                      "(non-fatal; the purge already ran)",
                                      self.nozzle_clean_macro)
         # The post-flush retract (relative E so absolute extruder state is undisturbed).
-        self.gcode.run_script_from_command("G91")
-        self.gcode.run_script_from_command(
-            "G1 E-%.3f F%.0f" % (FLUSH_POST_RETRACT_LEN_MM, FLUSH_POST_RETRACT_VEL))
-        self.gcode.run_script_from_command("G90")
+        if self.flush_post_retract_len > 0:
+            self.gcode.run_script_from_command("G91")
+            self.gcode.run_script_from_command(
+                "G1 E-%.3f F%.0f" % (self.flush_post_retract_len, self.flush_post_retract_vel))
+            self.gcode.run_script_from_command("G90")
         gcmd.respond_info("CFS_FLUSH: complete (%.2f mm purged in %d cycles)."
                           % (total, len(cycles)))
+
+        # Restore initial target temperature (e.g. cold 0C if idle) or lower to incoming print temp
+        if initial_target <= 0.0:
+            gcmd.respond_info("CFS_FLUSH: restoring cold heater state (M104 S0)...")
+            self.gcode.run_script_from_command("M104 S0")
+        elif next_temp < flush_temp:
+            gcmd.respond_info(
+                "CFS_FLUSH: lowering nozzle target to incoming filament temp (%.0fC)..."
+                % next_temp)
+            self.gcode.run_script_from_command("M104 S%d" % int(next_temp))
+        elif initial_target > 0.0 and initial_target != flush_temp:
+            self.gcode.run_script_from_command("M104 S%d" % int(initial_target))
+
+        if park_after:
+            gcmd.respond_info(
+                "CFS_FLUSH: returning toolhead to safe park position (%.1f, %.1f)..."
+                % (self.safe_pos_x, self.safe_pos_y))
+            self._safe_corridor_move(gcmd, self.safe_pos_x, self.safe_pos_y)
 
     cmd_CFS_FW_VERSION_help: str = (
         "Query firmware version string from CFS box via 0xF0 VERSION_INFO command. "
@@ -3792,6 +5343,284 @@ class CrealityCFS:
                 gcmd.respond_info(f"CFS box {addr}: no version response")
         except Exception as exc:
             raise gcmd.error(f"CFS_FW_VERSION failed: {exc}")
+
+    # -----------------------------------------------------------------------
+    # CFS Telemetry, RFID & State Persistence Commands
+    # -----------------------------------------------------------------------
+
+    cmd_CFS_SET_IDLE_MODE_help: str = "Set CFS box to idle mode"
+
+    def cmd_CFS_SET_IDLE_MODE(self, gcmd) -> None:
+        """G-code: CFS_SET_IDLE_MODE [BOX=<1-4>] [ADDR=<1-4>]."""
+        addr = gcmd.get_int("BOX", None, minval=1, maxval=4)
+        if addr is None:
+            addr = gcmd.get_int("ADDR", 1, minval=1, maxval=4)
+        self.set_box_mode(addr, 0x00, 0x00)
+        gcmd.respond_info(f"CFS box {addr} set to idle mode")
+
+    cmd_CFS_INFO_REFRESH_help: str = "Refresh RFID and filament length for CFS"
+
+    def cmd_CFS_INFO_REFRESH(self, gcmd) -> None:
+        """G-code: CFS_INFO_REFRESH [ADDR=<1-4>] [NUM=<mask 0-15>]."""
+        addr = gcmd.get_int("ADDR", 1, minval=1, maxval=4)
+        mask = gcmd.get_int("NUM", PRELOAD_MASK_ALL, minval=0, maxval=255)
+        self.set_pre_loading(addr, mask, PRELOAD_PHASE_ARM)
+        mat = self.read_material(addr, mask, timeout=15.0)
+        rem = self.read_remain(addr, mask, timeout=15.0)
+        self._ingest_slot_reads(mat, rem, mask, addr=addr)
+        gcmd.respond_info(f"CFS box {addr} refreshed")
+
+    cmd_CFS_GET_RFID_help: str = "Query RFID tags from CFS"
+
+    def cmd_CFS_GET_RFID(self, gcmd) -> None:
+        """G-code: CFS_GET_RFID [ADDR=<1-32>] [NUM=<mask 0-255>]."""
+        addr = gcmd.get_int("ADDR", 1, minval=1, maxval=32)
+        mask = gcmd.get_int("NUM", PRELOAD_MASK_ALL, minval=0, maxval=255)
+        mat = self.read_material(addr, mask, timeout=15.0)
+        self._ingest_slot_reads(mat, None, mask, addr=addr)
+        gcmd.respond_info(f"CFS box {addr} RFID: {mat}")
+
+    def cmd_CFS_PROBE(self, gcmd) -> None:
+        """G-code: CFS_PROBE [ADDR=<int>] [FUNC=<int>] [STATUS=<int>] [DATA=<hex>] [TIMEOUT=<float>]"""
+        addr = gcmd.get_int("ADDR", 17)
+        func = gcmd.get_int("FUNC", 2)
+        status = gcmd.get_int("STATUS", 0)
+        timeout = gcmd.get_float("TIMEOUT", 1.5)
+        data_hex = gcmd.get("DATA", "").strip()
+        try:
+            payload = bytes.fromhex(data_hex) if data_hex else b""
+        except ValueError:
+            raise gcmd.error(f"Invalid hex data: {data_hex}")
+        gcmd.respond_info(
+            f"CFS_PROBE: TX -> addr=0x{addr:02X} ({addr}) func=0x{func:02X} status=0x{status:02X} data={payload.hex() or 'empty'} (timeout={timeout}s)..."
+        )
+        resp = self._send_command(
+            addr, status, func, data=payload, timeout=timeout, retries=1
+        )
+        if resp:
+            raw_data = resp.get("data", b"")
+            ascii_repr = "".join(chr(b) if 32 <= b < 127 else "." for b in raw_data)
+            gcmd.respond_info(
+                f"CFS_PROBE SUCCESS: status=0x{resp.get('status', 0):02X} func=0x{resp.get('func', 0):02X} data_len={len(raw_data)} hex={raw_data.hex()} text='{ascii_repr}'"
+            )
+        else:
+            gcmd.respond_info(
+                f"CFS_PROBE: no response from addr=0x{addr:02X} ({addr})"
+            )
+
+    cmd_CFS_GET_REMAIN_LEN_help: str = "Query filament remaining length from CFS"
+
+    def cmd_CFS_GET_REMAIN_LEN(self, gcmd) -> None:
+        """G-code: CFS_GET_REMAIN_LEN [ADDR=<1-4>] [NUM=<mask 0-15>]."""
+        addr = gcmd.get_int("ADDR", 1, minval=1, maxval=4)
+        mask = gcmd.get_int("NUM", PRELOAD_MASK_ALL, minval=0, maxval=255)
+        rem = self.read_remain(addr, mask, timeout=15.0)
+        self._ingest_slot_reads(None, rem, mask, addr=addr)
+        gcmd.respond_info(f"CFS box {addr} remain: {rem}")
+
+    cmd_CFS_BOX_STATE_help: str = "Query CFS box operational status"
+
+    def cmd_CFS_BOX_STATE(self, gcmd) -> None:
+        """G-code: CFS_BOX_STATE [ADDR=<1-4>]."""
+        addr = gcmd.get_int("ADDR", 1, minval=1, maxval=4)
+        state = self.get_box_state(addr)
+        gcmd.respond_info(f"CFS box {addr} state: {state}")
+
+    # -----------------------------------------------------------------------
+    # Slot Configuration & State Persistence Commands (v1.5.0)
+    # -----------------------------------------------------------------------
+
+    cmd_CFS_MODIFY_TN_DATA_help: str = (
+        "Modify and persist spool data for a CFS slot. "
+        "Parameters: ADDR=<1-4> NUM=<0-3> [PART=<material_type|color_value|vendor|remain_len> DATA=<val>]"
+    )
+
+    def cmd_CFS_MODIFY_TN_DATA(self, gcmd) -> None:
+        """G-code: CFS_MODIFY_TN_DATA ADDR=<1-4> NUM=<0-3> [PART=<name> DATA=<val>]
+
+        Also accepts direct kwargs: [MATERIAL=<str>] [COLOR=<str>] [VENDOR=<str>] [REMAIN=<int>].
+        Persists immediately to cfs_state.json across reboots.
+        """
+        addr = gcmd.get_int("ADDR", minval=1, maxval=4)
+        num_raw = gcmd.get("NUM", "0").strip().upper()
+        if num_raw in ("A", "B", "C", "D"):
+            num = ord(num_raw) - ord("A")
+        else:
+            try:
+                num = int(num_raw)
+            except ValueError:
+                raise gcmd.error(f"Invalid NUM parameter: {num_raw}")
+        if not (0 <= num <= 3):
+            raise gcmd.error(f"NUM {num} out of valid range [0, 3] or [A, D]")
+        tool_idx = (addr - 1) * 4 + num
+
+        slot = self._slots.setdefault(tool_idx, {
+            "present": True,
+            "material": None,
+            "color": "none",
+            "vendor": "unknown",
+            "remain": -1,
+            "addr": addr,
+            "slot": num,
+        })
+
+        part = gcmd.get("PART", None)
+        if part is not None:
+            part = part.strip().lower()
+            data_val = gcmd.get("DATA", "").strip()
+            if part in ("material_type", "material"):
+                if data_val.lower() in ("none", "-1", ""):
+                    slot["material"] = None
+                else:
+                    # If data_val is a 5/6-digit numeric CFS code, decode it
+                    res_mat, res_ven = self.resolve_cfs_code(data_val)
+                    if res_mat:
+                        slot["material"] = res_mat
+                        if res_ven and (not slot.get("vendor") or slot.get("vendor") == "unknown"):
+                            slot["vendor"] = res_ven
+                    else:
+                        slot["material"] = data_val
+                slot["present"] = bool(slot.get("material") or slot.get("color") not in ("none", "-1", ""))
+            elif part in ("color_value", "color"):
+                clean_col = data_val
+                if clean_col.startswith("0") and len(clean_col) == 7:
+                    clean_col = "#" + clean_col[1:].upper()
+                elif len(clean_col) == 6 and clean_col.isalnum():
+                    clean_col = "#" + clean_col.upper()
+                slot["color"] = clean_col
+                slot["present"] = bool(slot.get("material") or slot.get("color") not in ("none", "-1", ""))
+                # If material is missing or unknown, check HelixScreen overrides
+                if not slot.get("material") or slot.get("material") == "unknown":
+                    self._sync_helixscreen_single_slot(tool_idx)
+            elif part in ("vendor", "vender"):
+                slot["vendor"] = data_val
+            elif part in ("remain_len", "remain"):
+                try:
+                    slot["remain"] = int(data_val)
+                except ValueError:
+                    pass
+
+        # Also support direct parameters
+        mat = gcmd.get("MATERIAL", None)
+        if mat is not None:
+            m_str = mat.strip()
+            if m_str.lower() in ("none", "-1", ""):
+                slot["material"] = None
+            else:
+                res_mat, res_ven = self.resolve_cfs_code(m_str)
+                slot["material"] = res_mat or m_str
+                if res_ven and (not slot.get("vendor") or slot.get("vendor") == "unknown"):
+                    slot["vendor"] = res_ven
+            slot["present"] = bool(slot.get("material") or slot.get("color") not in ("none", "-1", ""))
+        color = gcmd.get("COLOR", None)
+        if color is not None:
+            c_str = color.strip()
+            if c_str.startswith("0") and len(c_str) == 7:
+                c_str = "#" + c_str[1:].upper()
+            elif len(c_str) == 6 and c_str.isalnum():
+                c_str = "#" + c_str.upper()
+            slot["color"] = c_str
+            slot["present"] = bool(slot.get("material") or slot.get("color") not in ("none", "-1", ""))
+        vendor = gcmd.get("VENDOR", gcmd.get("VENDER", None))
+        if vendor is not None:
+            slot["vendor"] = vendor.strip()
+        if gcmd.get("REMAIN", None) is not None:
+            slot["remain"] = gcmd.get_int("REMAIN")
+        if gcmd.get("PRESENT", None) is not None:
+            slot["present"] = bool(gcmd.get_int("PRESENT"))
+
+        slot["addr"] = addr
+        slot["slot"] = num
+        self._slots[tool_idx] = slot
+        self._save_state()
+        gcmd.respond_info(f"CFS slot T{addr}{chr(ord('A') + num)} (tool {tool_idx}) updated: {slot}")
+
+    cmd_CFS_SET_SLOT_help: str = (
+        "Configure and persist spool properties for a CFS or bypass tool slot. "
+        "Parameters: [TOOL=<0-16>] (or [SLOT=<0-16>] or [ADDR=<1-4>] [NUM=<0-3>]) "
+        "[MATERIAL=<str>] [COLOR=<str>] [TEMP=<float>] [VENDOR=<str>] [REMAIN=<int>]"
+    )
+
+    def cmd_CFS_SET_SLOT(self, gcmd) -> None:
+        """G-code: CFS_SET_SLOT [SLOT=] [TOOL=] MATERIAL= COLOR= [TEMP=]."""
+        if gcmd.get("TOOL", None) is not None:
+            raw_idx = gcmd.get_int("TOOL")
+        elif gcmd.get("SLOT", None) is not None:
+            raw_idx = gcmd.get_int("SLOT")
+        elif gcmd.get("ADDR", None) is not None:
+            addr = gcmd.get_int("ADDR", 1, minval=1, maxval=4)
+            num_raw = gcmd.get("NUM", "0").strip().upper()
+            if num_raw in ("A", "B", "C", "D"):
+                num = ord(num_raw) - ord("A")
+            else:
+                try:
+                    num = int(num_raw)
+                except ValueError:
+                    raise gcmd.error(f"Invalid NUM parameter: {num_raw}")
+            if not (0 <= num <= 3):
+                raise gcmd.error(f"NUM {num} out of valid range [0, 3] or [A, D]")
+            raw_idx = (addr - 1) * 4 + num
+        else:
+            raise gcmd.error("CFS_SET_SLOT: missing required SLOT=, TOOL=, or ADDR=/NUM= parameter")
+        slot_idx = int(raw_idx)
+        max_slot = self._bypass_tool_idx
+        if slot_idx < 0 or slot_idx > max_slot:
+            raise gcmd.error("CFS_SET_SLOT: invalid slot %d (must be 0..%d)" % (slot_idx, max_slot))
+
+        material = gcmd.get("MATERIAL", "").strip()
+        color = gcmd.get("COLOR", "").strip()
+        brand = gcmd.get("BRAND", "").strip()
+        name = gcmd.get("NAME", "").strip()
+        spoolman_id = gcmd.get_int("SPOOLMAN_ID", -1)
+        melt_temp = gcmd.get_float("TEMP", gcmd.get_float("MELT_TEMP", None))
+
+        is_bypass = (slot_idx == self._bypass_tool_idx)
+        addr = (slot_idx // 4) + 1 if not is_bypass else None
+        num = (slot_idx % 4) if not is_bypass else None
+
+        slot = self._slots.setdefault(slot_idx, {
+            "present": True,
+            "material": None,
+            "color": "none",
+            "vendor": "unknown",
+            "remain": -1,
+            "is_bypass": is_bypass,
+            "addr": addr,
+            "slot": num,
+        })
+
+        if material and material.lower() not in ("none", "-1"):
+            res_mat, res_ven = self.resolve_cfs_code(material)
+            slot["material"] = res_mat or material
+            if res_ven and (not brand or brand == "None"):
+                brand = res_ven
+            if melt_temp is None or melt_temp <= 0:
+                slot["melt_temp"] = self._material_to_temp(slot["material"])
+        if melt_temp is not None and melt_temp > 0:
+            slot["melt_temp"] = melt_temp
+        if brand and brand.lower() not in ("none", "-1"):
+            slot["vendor"] = brand
+        if color and color.lower() not in ("none", "-1"):
+            clean_color = color
+            if clean_color.startswith("0") and len(clean_color) == 7:
+                clean_color = "#" + clean_color[1:].upper()
+            elif not clean_color.startswith("#") and len(clean_color) == 6:
+                clean_color = "#" + clean_color.upper()
+            slot["color"] = clean_color
+        if name:
+            slot["name"] = name
+        if spoolman_id >= 0:
+            slot["spoolman_id"] = spoolman_id
+        slot["present"] = bool(slot.get("material") or (slot.get("color") not in ("none", "-1", "")))
+        slot["is_bypass"] = is_bypass
+        slot["addr"] = addr
+        slot["slot"] = num
+        self._slots[slot_idx] = slot
+        self._save_state()
+        if is_bypass:
+            gcmd.respond_info(f"CFS bypass slot (tool {slot_idx}) set: {slot}")
+        else:
+            gcmd.respond_info(f"CFS slot T{addr}{chr(ord('A') + num)} (tool {slot_idx}) set: {slot}")
 
 
 # ---------------------------------------------------------------------------

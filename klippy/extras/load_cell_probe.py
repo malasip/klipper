@@ -11,6 +11,7 @@ import mathutil
 from . import hx71x
 from . import ads1220
 from . import ads131m0x
+from . import cs1237
 from . import probe, manual_probe, trigger_analog, load_cell
 
 np = None  # delay NumPy import until configuration time
@@ -601,10 +602,12 @@ class TapSession:
         self._results = []
 
     def start_probe_session(self, gcmd):
+        self._tapping_move._load_cell_probing_move._load_cell.start_sampling()
         return self
 
     def end_probe_session(self):
         self._results = []
+        self._tapping_move._load_cell_probing_move._load_cell.stop_sampling()
 
     # probe until a single good sample is returned or retries are exhausted
     def run_probe(self, gcmd):
@@ -637,16 +640,20 @@ class LoadCellProbeCommands:
         taps = gcmd.get_int("TAPS", 3, minval=1, maxval=10)
         timeout = gcmd.get_float("TIMEOUT", 30., minval=1., maxval=120.)
         gcmd.respond_info("Tap the load cell %s times:" % (taps,))
-        reactor = self._printer.get_reactor()
-        for i in range(0, taps):
-            result = self._load_cell_probing_move.probing_test(gcmd, timeout)
-            if result == 0.:
-                # notify of error, likely due to timeout
-                raise gcmd.error("Test timeout out")
-            gcmd.respond_info("Tap Detected!")
-            # give the user some time for their finger to move away
-            reactor.pause(reactor.monotonic() + 0.2)
-        gcmd.respond_info("Test complete, %s taps detected" % (taps,))
+        self._load_cell_probing_move._load_cell.start_sampling()
+        try:
+            reactor = self._printer.get_reactor()
+            for i in range(0, taps):
+                result = self._load_cell_probing_move.probing_test(gcmd, timeout)
+                if result == 0.:
+                    # notify of error, likely due to timeout
+                    raise gcmd.error("Test timeout out")
+                gcmd.respond_info("Tap Detected!")
+                # give the user some time for their finger to move away
+                reactor.pause(reactor.monotonic() + 0.2)
+            gcmd.respond_info("Test complete, %s taps detected" % (taps,))
+        finally:
+            self._load_cell_probing_move._load_cell.stop_sampling()
 
 
 class LoadCellParameterHelper:
@@ -672,6 +679,7 @@ class LoadCellPrinterProbe:
         # Sensor types supported by load_cell_probe
         sensors = {}
         sensors.update(hx71x.HX71X_SENSOR_TYPES)
+        sensors.update(cs1237.CS1237_SENSOR_TYPE)
         sensors.update(ads1220.ADS1220_SENSOR_TYPE)
         sensors.update(ads131m0x.ADS131M0X_SENSOR_TYPES)
         sensor_class = config.getchoice('sensor_type', sensors)
