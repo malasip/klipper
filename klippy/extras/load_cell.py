@@ -6,6 +6,7 @@
 
 from . import hx71x
 from . import ads1220
+from . import cs1237
 from . import ads131m0x
 from . import cs1237
 from .bulk_sensor import BatchWebhooksClient
@@ -564,6 +565,7 @@ def load_config(config):
     sensors.update(hx71x.HX71X_SENSOR_TYPES)
     sensors.update(cs1237.CS1237_SENSOR_TYPE)
     sensors.update(ads1220.ADS1220_SENSOR_TYPE)
+    sensors.update(cs1237.CS1237_SENSOR_TYPE)
     sensors.update(ads131m0x.ADS131M0X_SENSOR_TYPES)
     sensor_class = config.getchoice('sensor_type', sensors)
     return LoadCell(config, sensor_class(config))
